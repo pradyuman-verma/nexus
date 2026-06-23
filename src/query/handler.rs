@@ -23,10 +23,21 @@ Return JSON only, no prose outside the JSON, in exactly this shape: \
 \"answer\": \"your analysis, citing sources as [1], [2]; empty string if not answerable\", \
 \"sources\": [the source numbers you actually drew on; empty if not answerable]}";
 
-const TOP_K: i64 = 8;
+/// How many passages to pull before grouping them back under their items.
+const CHUNK_K: i64 = 16;
+/// Cap on distinct source items shown to the model / cited.
+const MAX_SOURCES: usize = 6;
+/// Cap on passages quoted per source.
+const MAX_PASSAGES_PER_ITEM: usize = 3;
 const MIN_SIMILARITY: f32 = 0.4;
 const NO_RESULTS: &str =
     "Nothing in our shared history covers that yet. Keep sharing and I'll get smarter.";
+
+/// A source item with the passages that matched the query.
+struct Source {
+    item: RetrievedItem,
+    passages: Vec<String>,
+}
 
 /// Handle a `/ask` / @mention query. Returns the HTML reply to send.
 pub async fn handle(
@@ -60,26 +71,27 @@ pub async fn handle(
     )
     .await;
 
-    // pgvector search.
-    let items = db::items::search(&state.pool, group_id, &qvec, TOP_K, MIN_SIMILARITY).await?;
+    // Chunk-level retrieval: search passages, then group them back under items.
+    let hits = db::chunks::search(&state.pool, group_id, &qvec, CHUNK_K, MIN_SIMILARITY).await?;
     tracing::info!(
         group_id,
         user_id,
-        retrieved = items.len(),
+        passages = hits.len(),
         query = %snippet(query_text, 80),
         "ask"
     );
-    if items.is_empty() {
+    let sources = group_hits(hits);
+    if sources.is_empty() {
         return Ok(NO_RESULTS.to_string());
     }
+    let items: Vec<RetrievedItem> = sources.iter().map(|s| s.item.clone()).collect();
 
-    // Tier 5: synthesize.
-    let context = build_context(&items);
+    // Tier 5: synthesize over the retrieved passages.
+    let context = build_context(&sources);
     let user_msg = format!("Sources:\n{context}\n\nQuestion: {query_text}");
     let raw = state.chat.synthesize(SYSTEM_PROMPT, &user_msg).await?;
 
-    let resolved = resolve_answer(&raw, items.len());
-    match resolved {
+    match resolve_answer(&raw, items.len()) {
         Some((answer, cited)) => {
             tracing::info!(group_id, answered = true, cited = cited.len(), "ask answered");
             Ok(formatter::query_answer(&answer, &items, &cited, group_id))
@@ -188,47 +200,70 @@ fn cited_in_text(text: &str, n: usize) -> Vec<usize> {
     sanitize_cited(&out, n)
 }
 
-/// How much actual article text to give the model per source. Distributed across
-/// the retrieved items, this keeps the prompt rich but bounded.
-const CONTENT_BUDGET_CHARS: usize = 2200;
+/// Group passage hits (already similarity-ordered) back under their source items,
+/// preserving rank, capped to `MAX_SOURCES` items and `MAX_PASSAGES_PER_ITEM` each.
+fn group_hits(hits: Vec<crate::db::chunks::ChunkHit>) -> Vec<Source> {
+    let mut order: Vec<uuid::Uuid> = Vec::new();
+    let mut map: std::collections::HashMap<uuid::Uuid, Source> = std::collections::HashMap::new();
 
-fn build_context(items: &[RetrievedItem]) -> String {
+    for hit in hits {
+        let entry = map.entry(hit.item_id).or_insert_with(|| {
+            order.push(hit.item_id);
+            Source {
+                item: RetrievedItem {
+                    id: hit.item_id,
+                    url: hit.url.clone(),
+                    title: hit.title.clone(),
+                    summary: hit.summary.clone(),
+                    raw_content: None,
+                    tags: Vec::new(),
+                    category: None,
+                    context_window: None,
+                    shared_by: hit.shared_by,
+                    shared_by_username: hit.username.clone(),
+                    message_id: hit.message_id,
+                    shared_at: hit.shared_at,
+                    similarity: hit.similarity,
+                },
+                passages: Vec::new(),
+            }
+        });
+        if entry.passages.len() < MAX_PASSAGES_PER_ITEM {
+            entry.passages.push(hit.content);
+        }
+    }
+
+    order
+        .into_iter()
+        .take(MAX_SOURCES)
+        .filter_map(|id| map.remove(&id))
+        .collect()
+}
+
+/// Build the Tier 5 context: each source numbered, with its title/sharer and the
+/// actual passages that matched — the model reasons over real text, not summaries.
+fn build_context(sources: &[Source]) -> String {
     let mut out = String::new();
-    for (i, item) in items.iter().enumerate() {
+    for (i, src) in sources.iter().enumerate() {
         let n = i + 1;
-        let label = formatter::item_label(item);
-        let summary = item.summary.as_deref().unwrap_or("(no summary)");
-        let tags = if item.tags.is_empty() {
-            String::new()
-        } else {
-            format!("\n   tags: {}", item.tags.join(", "))
-        };
-        let who = item
+        let label = formatter::item_label(&src.item);
+        let who = src
+            .item
             .shared_by_username
             .as_deref()
             .map(|u| format!("@{u}"))
             .unwrap_or_else(|| "someone".to_string());
-        let date = item.shared_at.format("%Y-%m-%d");
-        let ctx = item
-            .context_window
-            .as_ref()
-            .map(|c| c.as_text())
-            .filter(|t| !t.is_empty())
-            .map(|t| format!("\n   conversation when shared: {}", snippet(&t, 280)))
-            .unwrap_or_default();
-        // The actual article/transcript text — what lets the model reason instead
-        // of just restating the summary.
-        let content = item
-            .raw_content
-            .as_deref()
-            .map(|c| c.trim())
-            .filter(|c| !c.is_empty())
-            .map(|c| format!("\n   content: {}", snippet(c, CONTENT_BUDGET_CHARS)))
-            .unwrap_or_default();
+        let date = src.item.shared_at.format("%Y-%m-%d");
+        let passages = src
+            .passages
+            .iter()
+            .map(|p| format!("   \"…{}…\"", p.trim()))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         out.push_str(&format!(
-            "[{n}] {label} ({url})\n   shared by {who} on {date}{tags}\n   summary: {summary}{content}{ctx}\n\n",
-            url = item.url,
+            "[{n}] {label} ({url}) — shared by {who} on {date}\n{passages}\n\n",
+            url = src.item.url,
         ));
     }
     out

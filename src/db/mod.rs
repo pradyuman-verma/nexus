@@ -1,6 +1,7 @@
 //! Database access layer. Thin, hand-written sqlx queries (runtime-checked,
 //! so the project builds without a live database at compile time).
 
+pub mod chunks;
 pub mod edges;
 pub mod entities;
 pub mod groups;
@@ -47,6 +48,11 @@ pub async fn ensure_vector_schema(pool: &PgPool, dim: usize) -> Result<()> {
         format!(
             "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS interest_vector vector({dim})"
         ),
+        // chunks table is created by migration 007; its vector column lives here.
+        format!("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS embedding vector({dim})"),
+        "CREATE INDEX IF NOT EXISTS chunks_embedding_idx ON chunks \
+         USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
+            .to_string(),
     ];
     for stmt in stmts {
         // `dim` is an internal integer, never user input — safe to execute as

@@ -64,6 +64,14 @@ pub async fn try_handle(
                 .await;
             buildgraph(state, chat_id).await?
         }
+        "reindex" => {
+            // Backfill passage chunks for items ingested before chunk-level RAG.
+            let _ = state
+                .bot
+                .send_message(ChatId(chat_id), "🔁 Re-indexing existing items into passages…")
+                .await;
+            reindex(state, chat_id).await?
+        }
         _ => return Ok(false), // unknown command — ignore silently
     };
 
@@ -105,6 +113,39 @@ async fn ping(state: &AppState, chat_id: i64) -> String {
         esc(&state.config.ollama_chat_model),
         esc(&state.config.embedding_model),
     )
+}
+
+/// Backfill passage chunks for items that predate chunk-level RAG.
+async fn reindex(state: &AppState, chat_id: i64) -> Result<String> {
+    let missing = db::chunks::items_missing_chunks(&state.pool, chat_id, 100).await?;
+    let total = missing.len();
+    let mut indexed = 0usize;
+    let mut passages = 0usize;
+
+    for it in missing {
+        let title = it.title.unwrap_or_default();
+        let body = it
+            .raw_content
+            .filter(|s| !s.trim().is_empty())
+            .or(it.summary)
+            .unwrap_or_default();
+        if body.trim().is_empty() {
+            continue;
+        }
+        match crate::ingestion::pipeline::index_chunks(state, it.id, chat_id, &title, &body).await {
+            Ok(n) if n > 0 => {
+                indexed += 1;
+                passages += n;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(item_id = %it.id, error = %e, "reindex failed"),
+        }
+    }
+
+    Ok(format!(
+        "🔁 Re-indexed <b>{indexed}</b>/{total} items into <b>{passages}</b> passages. \
+         <code>/ask</code> now reads their full content."
+    ))
 }
 
 /// Run the Tier 4 graph builder on demand and report what it produced.

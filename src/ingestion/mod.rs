@@ -1,6 +1,7 @@
 //! The ingestion queue consumer — a continuous background task draining the
 //! mpsc channel fed by the message handler.
 
+pub mod chunker;
 pub mod fetcher;
 pub mod pipeline;
 pub mod youtube;

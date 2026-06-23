@@ -2,11 +2,12 @@
 
 use crate::bot::formatter::domain_of;
 use crate::db::{self, items::NewItem};
-use crate::ingestion::{fetcher, youtube};
+use crate::ingestion::{chunker, fetcher, youtube};
 use crate::models::IngestionJob;
 use crate::scorer::relevance::{self, ScoredItem};
 use crate::state::AppState;
 use anyhow::Result;
+use uuid::Uuid;
 
 const SUMMARIZE_TOKEN_BUDGET: usize = 4000;
 
@@ -122,6 +123,17 @@ async fn process_inner(state: &AppState, job: IngestionJob) -> Result<()> {
 
     tracing::info!(item_id = %item_id, url = %job.url, available, "item ingested");
 
+    // Passage-level index for chunk-based /ask retrieval. Use the full text when
+    // we have it, else fall back to the summary so every item is still searchable.
+    let body = if available {
+        extracted.text.as_str()
+    } else {
+        summary.as_str()
+    };
+    if let Err(e) = index_chunks(state, item_id, job.group_id, &title, body).await {
+        tracing::warn!(item_id = %item_id, error = %e, "chunk indexing failed");
+    }
+
     let Some(embedding) = embedding else {
         // No vector → no relevance scoring or profile update possible.
         return Ok(());
@@ -158,6 +170,38 @@ async fn process_inner(state: &AppState, job: IngestionJob) -> Result<()> {
     .await;
 
     Ok(())
+}
+
+/// Split `body` into passages, embed each (prefixed with the title for context),
+/// and replace the item's chunk set. Reused by ingestion and the `/reindex` backfill.
+pub async fn index_chunks(
+    state: &AppState,
+    item_id: Uuid,
+    group_id: i64,
+    title: &str,
+    body: &str,
+) -> Result<usize> {
+    let passages = chunker::chunk_text(body);
+    if passages.is_empty() {
+        return Ok(0);
+    }
+
+    let mut rows: Vec<(i32, String, Vec<f32>)> = Vec::with_capacity(passages.len());
+    for (i, passage) in passages.into_iter().enumerate() {
+        // Prefix the title so each passage carries document context into the vector.
+        let embed_input = format!("{title}\n{passage}");
+        match state.embedder.embed(&embed_input).await {
+            Ok(vec) => rows.push((i as i32, passage, vec)),
+            Err(e) => tracing::warn!(item_id = %item_id, chunk = i, error = %e, "chunk embed failed"),
+        }
+    }
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let n = rows.len();
+    db::chunks::replace_for_item(&state.pool, item_id, group_id, &rows).await?;
+    Ok(n)
 }
 
 fn truncate_summary(text: &str) -> String {
