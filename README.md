@@ -1,117 +1,147 @@
-# Nexus
+<h1 align="center">Nexus</h1>
 
-A group ambient intelligence layer for Telegram.
+<p align="center">
+  <b>A group ambient-intelligence layer for Telegram.</b><br>
+  It silently reads every link your group shares, builds a private knowledge brain over it,
+  and answers questions like a researcher — or DMs you the moment something relevant lands.
+</p>
 
-Add **@your_bot** to a group (or DM it). It silently watches every link shared,
-ingests the content, builds a per-group knowledge graph, scores relevance against
-each member's interest vector, and fires a **personal DM** when something one
-person shared is highly relevant to another. Tag it or use `/ask` to query the
-group's collective memory.
-
-No digests, no noise. Invisible until it has something worth saying.
-
----
-
-## Architecture
-
-Single Rust binary on one VM. Everything runs in-process on one Tokio runtime:
-
-```
-Telegram update → handler ──┬─ URL?      → context window → ingestion queue
-                            ├─ forward?  → ingestion queue
-                            └─ /ask | @mention → query handler (RAG)
-
-ingestion queue → fetch (Tier 1) → summarize (Tier 2 Haiku)
-               → embed (Tier 3) → store (pgvector) → relevance scorer → DM
-
-cron  6h  → graph builder (Tier 4 Sonnet): entities + edges
-cron 24h  → purge message buffer, log group stats
-cron 15m  → health check + retry failed fetches
-```
-
-| Tier | Default model | Provider | Used for |
-|------|---------------|----------|----------|
-| 1 | none | — | URL detect, fetch, Readability-style extraction, dedup |
-| 2 | `qwen2.5:3b-instruct` (local) | `TIER2_PROVIDER` (anthropic \| ollama) | summarize, tag, classify, relevance excerpt |
-| 3 | `mxbai-embed-large` (1024-dim) | local Ollama (or OpenAI/Voyage) | item + query + interest vectors |
-| 4 | Claude Sonnet | `GRAPH_PROVIDER` | entity / edge extraction (graph build) |
-| 5 | Claude Sonnet | `RAG_PROVIDER` | RAG answer synthesis |
-
-Every chat tier is independently routable to Claude or a local Ollama model via
-the `*_PROVIDER` env vars; embeddings run locally by default (no OpenAI account
-needed). See **Local models** below.
-
-### Module map
-
-```
-src/
-  main.rs          wiring: pool, clients, queue, consumer, cron, dispatcher
-  config.rs        typed env config
-  models.rs        shared domain types (ContextWindow is the moat)
-  state.rs         AppState injected everywhere
-  bot/             dispatcher, message handler, commands, HTML formatter
-  ingestion/       queue consumer, fetcher (extraction), pipeline (Tier 1→3)
-  llm/             ModelTier, Anthropic client, embedding client
-  db/              sqlx access: groups, items, profiles, entities, edges, notifications
-  scorer/          vector math + the relevance interrupt
-  graph/           Tier 4 batch entity/edge builder
-  query/           embed → pgvector → Tier 5 → formatted reply
-  cron/            scheduler + job bodies
-migrations/        001..005 (schema, pgvector, profiles, buffer, notifications)
-```
-
-> **Two things that must never be refactored away:** the `context_window` on every
-> item (the conversation around a shared link) and the relevance-interrupt DM.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#the-retrieval-pipeline">Retrieval</a> ·
+  <a href="#deployment">Deploy</a> ·
+  <a href="#configuration">Config</a>
+</p>
 
 ---
 
-## Local development (macOS)
+Add the bot to a Telegram group (or DM it). From then on it watches links in the
+background, ingests their **full content** (articles _and_ YouTube transcripts),
+splits it into searchable passages, builds a per-group **knowledge graph**, learns
+**what each member cares about**, and surfaces intelligence two ways:
 
-### 1. Postgres 16 + pgvector
+- **On demand** — `@mention` it or use `/ask`, and it runs a multi-stage retrieval
+  pipeline over everything the group has shared, then answers with cited sources.
+- **Proactively** — when one person shares something highly relevant to another's
+  interests, that person gets a **personal DM** with the exact relevant excerpt.
 
-Easiest — Docker (no models, just the DB):
+It's a **closed-corpus brain**: it only knows what your group has shared, never
+the open web. The LLM supplies reasoning; the knowledge is strictly your group's
+collective attention.
 
-```bash
-docker compose up -d      # Postgres 16 + pgvector on :5432, extension auto-created
-# DATABASE_URL=postgresql://nexus:nexus@localhost:5432/nexus
+---
+
+## Features
+
+- 🔗 **Silent link ingestion** — every URL shared is fetched, extracted, and indexed. No commands needed.
+- 📺 **Articles + YouTube** — Readability-style extraction for pages; `yt-dlp` transcripts for videos.
+- 🧠 **Chunk-level RAG** — content is split into overlapping passages and embedded, so it reads the _whole_ document, not a summary.
+- 🔎 **Hybrid retrieval** — semantic (pgvector) **+** keyword (Postgres full-text), fused with Reciprocal Rank Fusion.
+- 🕸️ **Knowledge graph** — entities (people, companies, topics) and edges extracted across items; used to expand retrieval along connections.
+- 🧭 **Multi-query / HyDE + self-correction** — expands your question into probes, and retries retrieval when the first pass falls short.
+- 🎯 **The relevance interrupt** — per-user interest vectors trigger a personal DM when something genuinely relevant to _you_ is shared.
+- 💬 **The context moat** — every item stores the 3–5 messages around the share, capturing _why_ it was shared, not just _what_.
+- 🪙 **Cheap & swappable models** — local Ollama embeddings + any OpenAI-compatible chat endpoint (DeepSeek, Groq, local, or Claude), routable per tier.
+- 🦀 **One Rust binary** — bot, ingestion worker, scorer, query engine, and cron all in-process. Postgres + pgvector alongside.
+
+---
+
+## How it works
+
+```
+Telegram update
+      │
+      ▼
+ message handler ─┬─ URL?         → capture context window → ingestion queue
+                  ├─ forwarded?   → capture origin          → ingestion queue
+                  └─ /ask | @mention → query engine
+
+ ingestion worker (continuous):
+   fetch (article | youtube) → extract → summarize+tag (LLM)
+     → chunk into passages → embed each (local) → store
+     → relevance scorer → DM anyone it's relevant to
+
+ query engine (/ask):
+   expand (HyDE+multi-query) → hybrid search (vector+keyword, RRF)
+     → graph expansion → cited synthesis → self-correct once if needed
+
+ cron:  6h graph build · 24h cleanup+stats · 15m health+retry
 ```
 
-Or natively:
+### Model tiers
+
+Each task uses the cheapest model that can do it. Chat tiers (2/4/5) are routed
+independently to any OpenAI-compatible endpoint or Claude; embeddings (3) run
+locally by default.
+
+| Tier | Task                                                         | Default                                   |
+| ---- | ------------------------------------------------------------ | ----------------------------------------- |
+| 1    | URL detect, fetch, extraction, chunking, dedup               | none                                      |
+| 2    | summarize, tag, classify, relevance excerpt, query expansion | chat model (`TIER2_PROVIDER`)             |
+| 3    | embed passages, queries, interest vectors                    | local Ollama `mxbai-embed-large` (1024-d) |
+| 4    | entity + edge extraction (graph)                             | chat model (`GRAPH_PROVIDER`)             |
+| 5    | RAG answer synthesis                                         | chat model (`RAG_PROVIDER`)               |
+
+---
+
+## The retrieval pipeline
+
+`/ask` is the centrepiece. It's a multi-stage retriever designed to "retrieve
+broadly, reason narrowly":
+
+1. **Query expansion (HyDE + multi-query)** — the LLM rewrites your question into
+   2–3 alternative probes plus a hypothetical answer paragraph. All are embedded.
+2. **Hybrid search** — for each embedding, a vector search over passages; plus a
+   keyword (full-text) search that catches exact terms, names, and acronyms
+   embeddings blur. All ranked lists are merged with **Reciprocal Rank Fusion**.
+3. **Graph expansion** — entities named in the question seed a one-hop walk of the
+   knowledge graph; items that _mention_ those entities are pulled in even if
+   vector similarity missed them.
+4. **Cited synthesis** — the top passages (grouped under their source items) go to
+   the LLM, which answers in plain prose, grounds every claim in a numbered
+   source, and lists only the sources it actually used.
+5. **Self-correction** — if the model reports it can't answer, it returns
+   `follow_up` queries; Nexus retrieves again targeting the gap and synthesizes
+   once more before saying "nothing relevant yet."
+
+Precision comes from three independent places — the keyword match, the graph
+filter, and the model's own answerability gate — so no single threshold can
+silently zero out results.
+
+---
+
+## Quick start (local dev, macOS/Linux)
+
+**1. Postgres 16 + pgvector** — easiest via Docker:
 
 ```bash
-brew install postgresql@16 pgvector && brew services start postgresql@16
-createdb nexus && psql nexus -c 'CREATE EXTENSION IF NOT EXISTS vector;'
+docker compose up -d        # Postgres + pgvector on :5432, extension auto-created
 ```
 
-The dimensioned vector columns + ANN index are created at startup from
-`EMBEDDING_DIM`, so the DB role just needs to own the `nexus` database.
+**2. Models** — install [Ollama](https://ollama.com) and pull an embedding model
+(used locally). For chat, either pull a local model too, or point the `OLLAMA_*`
+knobs at a hosted OSS provider (DeepSeek / Groq) — see [Swapping the chat model](#swapping-the-chat-model).
 
-### 2. Embeddings on your Mac
+```bash
+ollama pull mxbai-embed-large       # embeddings (Tier 3)
+ollama pull qwen2.5:3b-instruct     # local chat (Tiers 2/4/5) — or use DeepSeek/Groq
+```
 
-You said you don't want models on the Mac (storage). Two options:
-
-- **Point at the VM's Ollama:** set `EMBEDDING_BASE_URL=http://<vm-ip>:11434/v1/embeddings`
-  (and `OLLAMA_BASE_URL` likewise if routing chat tiers to it). Simplest for local testing.
-- **Run without embeddings:** the bot still boots and stores items; only vector
-  search / relevance scoring are skipped (logged as warnings). Fine for exercising
-  the handler and DB paths.
-
-### 3. Configure + run
+**3. Configure and run:**
 
 ```bash
 cp .env.example .env
-# required: TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, DATABASE_URL
-cargo run            # migrations + vector schema applied automatically on boot
+# set TELEGRAM_BOT_TOKEN, and an OLLAMA_API_KEY if using a hosted chat provider
+cargo run                   # migrations + vector schema applied automatically
 ```
 
-Migrations are embedded and applied at startup — no separate `sqlx migrate` step.
-
-### Tests
+**Tests:**
 
 ```bash
-cargo test                                  # unit tests (no DB needed)
+cargo test                  # unit tests, no DB needed
 
-# Integration test against a real DB:
+# integration test against a real DB:
 docker compose up -d
 TEST_DATABASE_URL=postgresql://nexus:nexus@localhost:5432/nexus \
   cargo test --test db_roundtrip -- --ignored --nocapture
@@ -119,30 +149,26 @@ TEST_DATABASE_URL=postgresql://nexus:nexus@localhost:5432/nexus \
 
 ---
 
-## Telegram setup (important)
+## Telegram setup
 
-1. **Create the bot** — message [@BotFather](https://t.me/BotFather) → `/newbot`,
-   copy the token into `TELEGRAM_BOT_TOKEN`.
-2. **Disable privacy mode** — BotFather → `/setprivacy` → select your bot →
-   **Disable**. Without this, Telegram only delivers messages that mention the
-   bot or are commands, and Nexus can't watch ambient links.
-3. **Add the bot to a group** (as a member; admin not required once privacy is off).
-4. **Each user must DM the bot `/start` once.** Bots cannot initiate DMs, so a
-   member who has never opened a chat with the bot will not receive relevance
-   notifications until they do. Nexus logs (not crashes) on such failures.
-5. Deep links (`t.me/c/...`) only resolve for **supergroups**, not basic groups
-   or DMs.
+1. **Create the bot** — [@BotFather](https://t.me/BotFather) → `/newbot` → copy the token into `TELEGRAM_BOT_TOKEN`.
+2. **Disable privacy mode** — BotFather → `/setprivacy` → **Disable**. Without this, Telegram only delivers commands/mentions and Nexus can't watch ambient links.
+3. **Add the bot to a group** (member is enough once privacy is off).
+4. **Each user DMs the bot `/start` once** — bots can't initiate DMs, so relevance notifications only reach members who've opened a chat with it.
+5. Deep links (`t.me/c/…`) resolve only for **supergroups**.
 
 ---
 
-## Bot commands
+## Commands
 
 ```
-/ask [question]      query the group's knowledge graph
+/ask [question]      query the group's knowledge — full retrieval pipeline
 /stats               items ingested, top tags, date range, pings sent
-/threshold [0.0-1.0] set your relevance sensitivity (lower = more pings; default 0.72)
-/mute                pause your notifications for 24h
-/unmute              resume notifications
+/threshold [0-1]     your relevance sensitivity (lower = more pings; default 0.72)
+/mute   /unmute      pause / resume your relevance notifications
+/ping                health check (DB + active models)
+/buildgraph          build the knowledge graph now (instead of waiting for cron)
+/reindex             backfill passage chunks for items ingested before chunking
 /help                what the bot does
 ```
 
@@ -150,113 +176,139 @@ You can also just `@mention` the bot with a question.
 
 ---
 
-## Local models
-
-Embeddings and Tier-2 chat run **locally via Ollama**; graph + `/ask` use Claude.
-Each chat tier is independently routable, so you tune the split to your hardware.
-
-**Default layout (CPU box — e.g. `m4.metal.small`, AMD EPYC 4244P, 6c/12t, 64 GB):**
-
-| Tier | Runs on | Model | Why |
-|------|---------|-------|-----|
-| 3 — embeddings | **local Ollama** | `mxbai-embed-large` (1024-dim) | it's an encoder — fast on CPU (~50–150 ms); 512-tok ctx is fine (we embed only distilled signal) |
-| 2 — summarize/excerpt | **local Ollama** | `qwen2.5:3b-instruct` | ~10–18 s/summary on 6 cores; runs in the background queue, not user-facing |
-| 4 — graph build (cron) | Claude | Sonnet | 20-item batch reasoning would crawl on CPU |
-| 5 — `/ask` (interactive) | Claude | Sonnet | user is waiting — CPU generation would take 30–60 s |
-
-**The CPU reality:** generation speed is capped by cores, not RAM. Encoders
-(embeddings) fly; autoregressive chat does not. So local makes sense for
-embeddings + the async Tier 2, while the reasoning-heavy / latency-sensitive
-tiers stay on Claude.
-
-**Tuning knobs (all in `.env`):**
-
-- Better tags, slower ingestion → `OLLAMA_CHAT_MODEL=qwen2.5:7b-instruct` (the Zen4 chip handles it).
-- Fastest ingestion → `TIER2_PROVIDER=anthropic` (Claude Haiku does summaries in ~1 s).
-- **No GPU but want fast + cheap chat** → point the chat knobs at a hosted OSS provider (the client is OpenAI-compatible): Groq `llama-3.3-70b-versatile` (~$0.59/M, hundreds of tok/s) or DeepSeek `deepseek-chat` (~$0.28/M). Set `OLLAMA_BASE_URL`, `OLLAMA_CHAT_MODEL`, `OLLAMA_API_KEY` and route tiers to `ollama`. ~100× cheaper than Claude, `/ask` in seconds. See `.env.example` for exact values.
-- Swap embedding model → change **both** `EMBEDDING_MODEL` and `EMBEDDING_DIM` (vector columns are created at that dim on first boot — changing it needs a fresh DB).
-- **GPU box only:** fully local (`GRAPH_PROVIDER=ollama`, `RAG_PROVIDER=ollama`, `qwen2.5:32b-instruct`). On CPU, 32B answers `/ask` in minutes — don't.
-
----
-
 ## Deployment (any Ubuntu 24.04 VM / bare metal)
 
-One script does everything — Postgres + pgvector, Rust, Ollama + models, the
-release build, and a systemd service. First get the code onto the VM **into your
-home dir** (a non-root user can't write to `/opt`, and rsync can't sudo
-mid-transfer); `install.sh` then copies it to `/opt/nexus` itself.
+One script installs everything — Postgres + pgvector, Rust, Ollama + models,
+`yt-dlp`, the release build, and a systemd service. It's idempotent.
 
 ```bash
-# from your Mac (no git needed) — note the leading-slash-free target:
-rsync -av --exclude target --exclude .env --exclude .git \
-  /Users/you/Desktop/nexus/ ubuntu@VM_IP:nexus/
+# get the code onto the VM, into your home dir (a non-root user can't write /opt):
+rsync -av --exclude target --exclude .env --exclude .git ./ user@VM_IP:nexus/
 
-# on the VM:
-ssh ubuntu@VM_IP
+ssh user@VM_IP
 cd ~/nexus
-sudo bash install.sh            # → installs everything, copies source to /opt/nexus
-nano /opt/nexus/.env            # set TELEGRAM_BOT_TOKEN + ANTHROPIC_API_KEY
+sudo bash install.sh        # → copies to /opt/nexus, builds, registers service
+nano /opt/nexus/.env        # set TELEGRAM_BOT_TOKEN (+ chat provider key)
 sudo systemctl start nexus
 journalctl -u nexus -f
 ```
 
-(Or, if you've pushed to GitHub: `git clone <repo> ~/nexus` instead of rsync.)
+`install.sh` is configurable via env (`EMBED_MODEL`, `CHAT_MODEL`,
+`INSTALL_CHAT_MODEL`, `DB_PASSWORD`, …) and fills `DATABASE_URL` + model settings
+into `.env` for you — you only add the tokens.
 
-`install.sh` is idempotent and configurable via env vars — defaults are already
-CPU-sized, but you can override:
+**Hardware note:** embeddings (an encoder) are fast on CPU; LLM _generation_ is
+not. On a GPU-less box, run embeddings locally and point the chat tiers at a cheap
+hosted OSS endpoint (DeepSeek / Groq) for fast, near-free `/ask`. 64 GB RAM
+doesn't make CPU generation fast — a 70B model fits but crawls.
 
-```bash
-# e.g. better tags via a 7B Tier-2 model:
-CHAT_MODEL=qwen2.5:7b-instruct sudo -E bash install.sh
+---
+
+## Configuration
+
+Everything is set in `.env` (see [`.env.example`](.env.example)). Highlights:
+
+| Var                                                        | Default                      | Meaning                                                                |
+| ---------------------------------------------------------- | ---------------------------- | ---------------------------------------------------------------------- |
+| `TELEGRAM_BOT_TOKEN`                                       | —                            | required                                                               |
+| `DATABASE_URL`                                             | —                            | Postgres connection string                                             |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIM`                        | `mxbai-embed-large` / `1024` | embedding model + its dimension (must match; set at first boot)        |
+| `EMBEDDING_BASE_URL`                                       | local Ollama                 | OpenAI-compatible `/v1/embeddings` endpoint                            |
+| `TIER2_PROVIDER` / `GRAPH_PROVIDER` / `RAG_PROVIDER`       | `ollama`                     | per-tier chat backend: `ollama` (any OpenAI-compatible) or `anthropic` |
+| `OLLAMA_BASE_URL` / `OLLAMA_CHAT_MODEL` / `OLLAMA_API_KEY` | local                        | chat endpoint — point at Ollama, DeepSeek, Groq, etc.                  |
+| `YTDLP_PATH`                                               | `yt-dlp`                     | binary for YouTube transcripts                                         |
+| `CONTEXT_WINDOW_WAIT_SECS`                                 | `60`                         | how long to wait for trailing context after a link                     |
+| `DEFAULT_RELEVANCE_THRESHOLD`                              | `0.72`                       | cosine threshold for a relevance DM                                    |
+| `MAX_VECTOR_WEIGHT`                                        | `100.0`                      | caps interest-vector accumulation so old items fade                    |
+| `GRAPH_CRON_SCHEDULE`                                      | `0 0 */6 * * *`              | 6-field cron (sec min hour dom mon dow)                                |
+
+> **Note:** this is a committed template — never put real secrets in `.env.example`.
+> It's read by systemd's `EnvironmentFile`, which does **not** strip trailing
+> `# comments`, so keep comments on their own lines.
+
+### Swapping the chat model
+
+`/ask`, summaries, and graph extraction can run on any OpenAI-compatible endpoint.
+To use DeepSeek for all chat tiers, for example:
+
+```env
+TIER2_PROVIDER=ollama
+GRAPH_PROVIDER=ollama
+RAG_PROVIDER=ollama
+OLLAMA_BASE_URL=https://api.deepseek.com/v1
+OLLAMA_CHAT_MODEL=deepseek-chat
+OLLAMA_API_KEY=sk-...
 ```
 
-It writes a generated DB password into `/opt/nexus/.env` and fills in
-`DATABASE_URL`, embedding + chat model settings automatically — you only add the
-two tokens.
+Changing `EMBEDDING_DIM` requires a fresh database (vector columns are created at
+that dimension on first boot).
 
 ---
 
-## Configuration reference
+## Data model
 
-All knobs live in `.env` (see `.env.example`). Notable ones:
+| Table               | Purpose                                                                                                         |
+| ------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `groups`, `users`   | Telegram chats and members                                                                                      |
+| `user_profiles`     | per-user, per-group **interest vector** + relevance threshold + mute                                            |
+| `items`             | one row per shared link: url, title, summary, tags, `content_type`, `context_window` (the moat), item embedding |
+| `chunks`            | passage-level text + embedding (the `/ask` retrieval unit) + a full-text index                                  |
+| `entities`, `edges` | the knowledge graph                                                                                             |
+| `messages_buffer`   | 48h rolling buffer to reconstruct context windows                                                               |
+| `notifications_log` | dedup + calibration log for relevance DMs                                                                       |
 
-| Var | Default | Meaning |
-|-----|---------|---------|
-| `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `nomic-embed-text` / `768` | embedding model + its vector dimension (must match) |
-| `EMBEDDING_BASE_URL` | local Ollama | OpenAI-compatible `/v1/embeddings` endpoint |
-| `EMBEDDING_API_KEY` | — | only for hosted embedding providers (OpenAI/Voyage) |
-| `TIER2_PROVIDER` / `GRAPH_PROVIDER` / `RAG_PROVIDER` | `anthropic` | per-tier chat backend: `anthropic` or `ollama` |
-| `OLLAMA_BASE_URL` / `OLLAMA_CHAT_MODEL` | localhost / `qwen2.5:3b-instruct` | local chat server + model |
-| `CONTEXT_WINDOW_WAIT_SECS` | 60 | how long to wait for trailing context after a link |
-| `DEFAULT_RELEVANCE_THRESHOLD` | 0.72 | cosine threshold for a notification |
-| `MAX_VECTOR_WEIGHT` | 100.0 | caps interest-vector accumulation so old items fade |
-| `URL_DEDUP_DAYS` | 7 | suppress re-ingesting the same URL in a group |
-| `NOTIFICATION_SCORE_LOG` | true | log below-threshold scores for calibration |
-| `GRAPH_CRON_SCHEDULE` | `0 0 */6 * * *` | 6-field cron (sec min hour dom mon dow) |
+Migrations are embedded in the binary and applied at startup; the dimensioned
+vector columns + ANN indexes are created at boot from `EMBEDDING_DIM`.
 
 ---
 
-## Notes on the content extractor
+## Project structure
 
-Nexus uses a dependency-light Readability-style extractor (`scraper` for
-metadata + main-content selection, `html2text` as fallback) rather than a port
-of Mozilla Readability. It strips nav/header/footer/sidebar chrome, pulls
-`og:`/`<title>`/author/published metadata, and truncates to ~4000 tokens before
-the Tier 2 call. Paywalls / JS-only SPAs degrade gracefully: the item is stored
-with whatever metadata is available and marked `pending_retry`, still useful for
-graph edges and notifications.
+```
+src/
+  main.rs / lib.rs      wiring + library surface (so tests can drive internals)
+  config.rs, state.rs   typed env config; shared AppState
+  models.rs             domain types (ContextWindow, RetrievedItem, …)
+  bot/                  teloxide dispatcher, message handler, commands, HTML formatter
+  ingestion/            queue consumer, fetcher, youtube transcripts, chunker, pipeline
+  llm/                  ModelTier, chat router (per-tier provider), Ollama/Anthropic/embeddings
+  db/                   sqlx access: items, chunks, entities, edges, graph, profiles, …
+  scorer/               vector math + the relevance interrupt
+  graph/                Tier 4 batch entity/edge builder
+  query/                the retrieval pipeline (expand → hybrid → graph → synth → self-correct)
+  cron/                 scheduler + jobs
+migrations/             001–008 (schema, pgvector, profiles, buffer, notifications, content_type, chunks, FTS)
+install.sh              one-shot VM installer
+docker-compose.yml      local Postgres + pgvector
+```
 
-### YouTube (v2)
+---
 
-`youtube.com` / `youtu.be` links are routed to a transcript fetcher instead of
-the HTML extractor: `yt-dlp -J` returns metadata + caption-track URLs in one
-call, the English VTT captions are fetched and parsed to clean text, then summarized
-and embedded like any article. Items are tagged `content_type = video`. Videos
-without captions fall back to the description. Requires `yt-dlp` (installed by
-`install.sh` as a standalone Linux binary; configurable via `YTDLP_PATH`).
+## Roadmap
 
-## Not in v1
+**Done:** silent ingestion · article + YouTube · chunk-level RAG · hybrid search ·
+knowledge graph + graph-aware retrieval · multi-query/HyDE · self-correcting
+synthesis · the relevance interrupt · per-tier model routing.
 
-Weekly digests, web dashboard, X/Twitter, podcast ingestion, personal graphs,
-cross-group signals, billing. The schema carries `source` + `content_type` and
-graph tables so these slot in without migration pain.
+**Next:** X/Twitter ingestion · PDF support · a read-only web dashboard
+(force-directed graph + timeline + search) · podcast (Whisper) ingestion ·
+cross-group convergence signals.
+
+The schema already carries `source` and `content_type`, so new input channels
+slot in without migration pain.
+
+---
+
+## Two things that must never be refactored away
+
+1. **The `context_window` on every item** — the conversation around a shared link.
+   "lol this is exactly what we're building" next to a fundraise link is metadata
+   no bookmarking tool captures. It tells the graph _why_ something was shared.
+2. **The relevance interrupt** — the personal DM with the exact relevant excerpt.
+   Not a digest, not a summary — the moment the product feels like magic.
+
+---
+
+## License
+
+MIT © Nexus contributors. See [LICENSE](LICENSE).

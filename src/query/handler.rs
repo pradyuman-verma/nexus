@@ -16,12 +16,14 @@ synthesized answer to the question. Think like a researcher, not a search engine
 Ground every factual claim in the sources and cite them as [n]; never invent facts, \
 numbers, or sources. You MAY add interpretation and connect dots beyond the literal \
 text, as long as the underlying facts trace to the sources. If the sources genuinely \
-can't support an answer, set \"answerable\" to false.\n\
+can't support an answer, set \"answerable\" to false and put 2-3 search queries that \
+WOULD locate the missing information into \"follow_up\".\n\
 Write the answer as plain text — no markdown (no **bold**, #headings, or backticks). \
 Return JSON only, no prose outside the JSON, in exactly this shape: \
 {\"answerable\": true|false, \
 \"answer\": \"your analysis, citing sources as [1], [2]; empty string if not answerable\", \
-\"sources\": [the source numbers you actually drew on; empty if not answerable]}";
+\"sources\": [the source numbers you actually drew on; empty if not answerable], \
+\"follow_up\": [\"search queries to find missing info; empty when answerable\"]}";
 
 /// How many passages to pull before grouping them back under their items.
 const CHUNK_K: i64 = 16;
@@ -58,7 +60,7 @@ pub async fn handle(
         );
     }
 
-    // Tier 3: embed the query.
+    // Tier 3: embed the query (also the interest signal below).
     let qvec = state.embedder.embed(query_text).await?;
 
     // Querying is the strongest interest signal (weight 3.0).
@@ -75,61 +77,101 @@ pub async fn handle(
     )
     .await;
 
-    // Hybrid retrieval: vector (semantic) + keyword (lexical) passage search,
-    // fused with Reciprocal Rank Fusion. Keyword catches exact terms / proper
-    // nouns that embeddings miss; vector catches paraphrase.
-    let vector_hits = db::chunks::search(&state.pool, group_id, &qvec, CHUNK_K, MIN_SIMILARITY).await?;
-    let keyword_hits = db::chunks::keyword_search(&state.pool, group_id, query_text, CHUNK_K)
-        .await
-        .unwrap_or_default();
-    let (nv, nk) = (vector_hits.len(), keyword_hits.len());
-    let hits = rrf_fuse(vec![vector_hits, keyword_hits], CHUNK_K as usize);
-    tracing::info!(
-        group_id,
-        user_id,
-        vector = nv,
-        keyword = nk,
-        fused = hits.len(),
-        query = %snippet(query_text, 80),
-        "ask"
-    );
-    let mut sources = group_hits(hits);
-
-    // Graph-aware expansion: pull in items connected to entities named in the
-    // query, even if vector similarity missed them.
-    let graph_added = expand_with_graph(state, group_id, query_text, &qvec, &mut sources).await;
-
-    if sources.is_empty() {
-        return Ok(NO_RESULTS.to_string());
-    }
-    tracing::info!(group_id, sources = sources.len(), graph_added, "ask context");
-    let items: Vec<RetrievedItem> = sources.iter().map(|s| s.item.clone()).collect();
-
-    // Tier 5: synthesize over the retrieved passages.
-    let context = build_context(&sources);
-    let user_msg = format!("Sources:\n{context}\n\nQuestion: {query_text}");
-    let raw = state.chat.synthesize(SYSTEM_PROMPT, &user_msg).await?;
-
-    match resolve_answer(&raw, items.len()) {
-        Some((answer, cited)) => {
-            tracing::info!(group_id, answered = true, cited = cited.len(), "ask answered");
-            Ok(formatter::query_answer(&answer, &items, &cited, group_id))
-        }
-        None => {
-            tracing::info!(group_id, answered = false, "ask answered");
-            Ok(NO_RESULTS.to_string())
+    // Multi-query / HyDE: expand the question into extra probes + a hypothetical
+    // answer, embed them all, and retrieve over the union (failure-tolerant —
+    // falls back to just the original query).
+    let expansion = state.chat.expand_query(query_text).await.unwrap_or_default();
+    let mut embeds = vec![qvec.clone()];
+    let extra_probes: Vec<String> = expansion
+        .probes
+        .into_iter()
+        .chain(std::iter::once(expansion.hyde))
+        .filter(|p| !p.trim().is_empty())
+        .collect();
+    for probe in &extra_probes {
+        if let Ok(e) = state.embedder.embed(probe).await {
+            embeds.push(e);
         }
     }
+    tracing::info!(group_id, user_id, probes = extra_probes.len(), query = %snippet(query_text, 80), "ask expand");
+
+    // Retrieve (hybrid + graph), synthesize, and self-correct once if the model
+    // says the corpus can't answer and offers follow-up queries.
+    let mut keyword_query = query_text.to_string();
+    for attempt in 0..2u8 {
+        let hits = hybrid_retrieve(state, group_id, &keyword_query, &embeds).await;
+        let mut sources = group_hits(hits);
+        let graph_added = expand_with_graph(state, group_id, query_text, &qvec, &mut sources).await;
+
+        if sources.is_empty() {
+            return Ok(NO_RESULTS.to_string());
+        }
+        tracing::info!(group_id, attempt, sources = sources.len(), graph_added, "ask context");
+
+        let items: Vec<RetrievedItem> = sources.iter().map(|s| s.item.clone()).collect();
+        let context = build_context(&sources);
+        let user_msg = format!("Sources:\n{context}\n\nQuestion: {query_text}");
+        let raw = state.chat.synthesize(SYSTEM_PROMPT, &user_msg).await?;
+
+        match resolve_outcome(&raw, items.len()) {
+            AnswerOutcome::Answered { answer, cited } => {
+                tracing::info!(group_id, attempt, answered = true, cited = cited.len(), "ask answered");
+                return Ok(formatter::query_answer(&answer, &items, &cited, group_id));
+            }
+            AnswerOutcome::NeedMore { follow_up } => {
+                // Out of retries, or no leads to chase → give up gracefully.
+                if attempt >= 1 || follow_up.is_empty() {
+                    tracing::info!(group_id, attempt, answered = false, "ask answered");
+                    return Ok(NO_RESULTS.to_string());
+                }
+                // Second-pass retrieval targeting the gap the model flagged.
+                tracing::info!(group_id, follow_ups = follow_up.len(), "ask self-correcting");
+                for q in &follow_up {
+                    if let Ok(e) = state.embedder.embed(q).await {
+                        embeds.push(e);
+                    }
+                }
+                keyword_query = format!("{query_text} {}", follow_up.join(" "));
+            }
+        }
+    }
+
+    Ok(NO_RESULTS.to_string())
 }
 
-/// Turn the model's raw response into `(answer_text, cited_indices)`, or None
-/// when there's no usable answer. Robust to schema drift: accepts our strict
-/// `{answerable, answer, sources}` shape, alternative keys (`text`/`response`/
-/// `summary`), and plain prose — and NEVER surfaces raw JSON to the user.
-fn resolve_answer(raw: &str, n: usize) -> Option<(String, Vec<usize>)> {
+/// Hybrid retrieval over multiple query embeddings: vector search per embedding
+/// + one keyword search, all fused with RRF.
+async fn hybrid_retrieve(
+    state: &AppState,
+    group_id: i64,
+    keyword_query: &str,
+    embeds: &[Vec<f32>],
+) -> Vec<crate::db::chunks::ChunkHit> {
+    let mut lists = Vec::new();
+    for e in embeds {
+        if let Ok(h) = db::chunks::search(&state.pool, group_id, e, CHUNK_K, MIN_SIMILARITY).await {
+            lists.push(h);
+        }
+    }
+    match db::chunks::keyword_search(&state.pool, group_id, keyword_query, CHUNK_K).await {
+        Ok(k) => lists.push(k),
+        Err(e) => tracing::debug!(error = %e, "keyword search failed"),
+    }
+    rrf_fuse(lists, CHUNK_K as usize)
+}
+
+/// Outcome of resolving a Tier 5 response.
+enum AnswerOutcome {
+    Answered { answer: String, cited: Vec<usize> },
+    NeedMore { follow_up: Vec<String> },
+}
+
+/// Resolve a Tier 5 response into an outcome. Robust to schema drift: accepts our
+/// strict `{answerable, answer, sources, follow_up}` shape, alternative answer keys
+/// (`text`/`response`/`summary`), and plain prose — and NEVER surfaces raw JSON.
+fn resolve_outcome(raw: &str, n: usize) -> AnswerOutcome {
     let cleaned = strip_fences(raw);
 
-    // Try to parse a JSON object out of the response.
     let json: Option<serde_json::Value> = serde_json::from_str(cleaned).ok().or_else(|| {
         let (s, e) = (cleaned.find('{'), cleaned.rfind('}'));
         match (s, e) {
@@ -139,11 +181,12 @@ fn resolve_answer(raw: &str, n: usize) -> Option<(String, Vec<usize>)> {
     });
 
     if let Some(v) = &json {
-        // Explicit "not answerable" → no answer.
+        let follow_up = string_array(v, "follow_up");
+
+        // Explicit "not answerable" → ask for more, with the model's leads.
         if v.get("answerable").and_then(serde_json::Value::as_bool) == Some(false) {
-            return None;
+            return AnswerOutcome::NeedMore { follow_up };
         }
-        // Pull the answer text from whichever key the model used.
         let answer = ["answer", "text", "response", "summary"]
             .iter()
             .find_map(|k| v.get(*k).and_then(serde_json::Value::as_str))
@@ -151,7 +194,6 @@ fn resolve_answer(raw: &str, n: usize) -> Option<(String, Vec<usize>)> {
             .filter(|s| !s.is_empty());
 
         if let Some(answer) = answer {
-            // Prefer an explicit, valid sources array; else infer from [n] markers.
             let explicit: Vec<usize> = v
                 .get("sources")
                 .and_then(serde_json::Value::as_array)
@@ -168,18 +210,40 @@ fn resolve_answer(raw: &str, n: usize) -> Option<(String, Vec<usize>)> {
             } else {
                 cited
             };
-            return Some((answer.to_string(), cited));
+            return AnswerOutcome::Answered {
+                answer: answer.to_string(),
+                cited,
+            };
         }
-        // It was JSON but we couldn't find an answer field — don't leak braces.
-        return None;
+        // JSON but no answer field — don't leak braces; treat as "need more".
+        return AnswerOutcome::NeedMore { follow_up };
     }
 
-    // Not JSON at all → treat as plain prose, infer citations from the text.
+    // Not JSON → plain prose answer, infer citations from the text.
     let prose = cleaned.trim();
     if prose.is_empty() || prose.starts_with('{') {
-        return None;
+        return AnswerOutcome::NeedMore {
+            follow_up: Vec::new(),
+        };
     }
-    Some((prose.to_string(), cited_in_text(prose, n)))
+    AnswerOutcome::Answered {
+        answer: prose.to_string(),
+        cited: cited_in_text(prose, n),
+    }
+}
+
+/// Extract a JSON string array field, trimming/dropping empties.
+fn string_array(v: &serde_json::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn strip_fences(raw: &str) -> &str {
@@ -384,9 +448,16 @@ fn snippet(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn answered(raw: &str, n: usize) -> (String, Vec<usize>) {
+        match resolve_outcome(raw, n) {
+            AnswerOutcome::Answered { answer, cited } => (answer, cited),
+            AnswerOutcome::NeedMore { .. } => panic!("expected Answered, got NeedMore"),
+        }
+    }
+
     #[test]
     fn strict_schema_with_citations() {
-        let (ans, cited) = resolve_answer(r#"{"answerable":true,"answer":"hi [2]","sources":[2]}"#, 3).unwrap();
+        let (ans, cited) = answered(r#"{"answerable":true,"answer":"hi [2]","sources":[2]}"#, 3);
         assert_eq!(ans, "hi [2]");
         assert_eq!(cited, vec![2]);
     }
@@ -395,32 +466,38 @@ mod tests {
     fn wrong_shape_does_not_leak_json() {
         // The bug from the field: model returned {"text": ...}. Must extract the
         // text, never surface raw braces.
-        let (ans, cited) = resolve_answer(r#"{"text":"some answer"}"#, 5).unwrap();
+        let (ans, cited) = answered(r#"{"text":"some answer"}"#, 5);
         assert_eq!(ans, "some answer");
         assert!(cited.is_empty());
     }
 
     #[test]
-    fn explicit_not_answerable_is_none() {
-        assert!(resolve_answer(r#"{"answerable":false,"answer":"","sources":[]}"#, 3).is_none());
+    fn explicit_not_answerable_yields_follow_up() {
+        match resolve_outcome(
+            r#"{"answerable":false,"answer":"","sources":[],"follow_up":["q1","q2"]}"#,
+            3,
+        ) {
+            AnswerOutcome::NeedMore { follow_up } => assert_eq!(follow_up, vec!["q1", "q2"]),
+            AnswerOutcome::Answered { .. } => panic!("expected NeedMore"),
+        }
     }
 
     #[test]
     fn plain_prose_infers_citations() {
-        let (ans, cited) = resolve_answer("Plain answer drawing on [1] and [3].", 3).unwrap();
+        let (ans, cited) = answered("Plain answer drawing on [1] and [3].", 3);
         assert_eq!(ans, "Plain answer drawing on [1] and [3].");
         assert_eq!(cited, vec![1, 3]);
     }
 
     #[test]
     fn citations_inferred_when_array_missing() {
-        let (_, cited) = resolve_answer(r#"{"answer":"uses [1] and [2]"}"#, 4).unwrap();
+        let (_, cited) = answered(r#"{"answer":"uses [1] and [2]"}"#, 4);
         assert_eq!(cited, vec![1, 2]);
     }
 
     #[test]
     fn fenced_json_is_parsed() {
-        let (ans, _) = resolve_answer("```json\n{\"answerable\":true,\"answer\":\"x\",\"sources\":[]}\n```", 2).unwrap();
+        let (ans, _) = answered("```json\n{\"answerable\":true,\"answer\":\"x\",\"sources\":[]}\n```", 2);
         assert_eq!(ans, "x");
     }
 

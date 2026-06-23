@@ -122,6 +122,19 @@ impl Chat {
         self.complete(Tier::Two, None, &user, 256).await
     }
 
+    // ── Query expansion (HyDE + multi-query) for retrieval ─────────────────
+    pub async fn expand_query(&self, question: &str) -> Result<QueryExpansion> {
+        let user = format!(
+            "User question: {question}\n\n\
+             Generate retrieval aids to find documents that answer it. \
+             Return JSON only: \
+             {{\"probes\": [\"2-3 alternative phrasings or focused sub-questions\"], \
+             \"hyde\": \"1-3 sentences of a plausible hypothetical answer such a document might contain\"}}"
+        );
+        let raw = self.complete(Tier::Two, None, &user, 400).await?;
+        parse_json(&raw).context("parsing query expansion")
+    }
+
     // ── Tier 4: entity + edge extraction ────────────────────────────────────
     pub async fn extract_graph(&self, batch_prompt: &str) -> Result<String> {
         self.complete(Tier::Four, None, batch_prompt, 4096).await
@@ -139,6 +152,15 @@ enum Tier {
     Two,
     Four,
     Five,
+}
+
+/// Retrieval probes generated from a user question (HyDE + multi-query).
+#[derive(serde::Deserialize, Default)]
+pub struct QueryExpansion {
+    #[serde(default)]
+    pub probes: Vec<String>,
+    #[serde(default)]
+    pub hyde: String,
 }
 
 /// Tolerantly pull a JSON object out of an LLM response (handles ```json fences).
