@@ -1,0 +1,29 @@
+# Local dev: Postgres 16 with pgvector preinstalled.
+# No models here — you run embeddings/chat against the VM's Ollama, or via
+# Claude. Bring it up with:  docker compose up -d
+#
+# Then point .env at it:
+#   DATABASE_URL=postgresql://nexus:nexus@localhost:5432/nexus
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: nexus-db
+    environment:
+      POSTGRES_USER: nexus
+      POSTGRES_PASSWORD: nexus
+      POSTGRES_DB: nexus
+    ports:
+      - "5432:5432"
+    volumes:
+      - nexus_pgdata:/var/lib/postgresql/data
+      # Auto-create the extension on first init.
+      - ./scripts/init-pgvector.sql:/docker-entrypoint-initdb.d/00-pgvector.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus -d nexus"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  nexus_pgdata:
