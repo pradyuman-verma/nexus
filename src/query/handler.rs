@@ -29,7 +29,11 @@ const CHUNK_K: i64 = 16;
 const MAX_SOURCES: usize = 6;
 /// Cap on passages quoted per source.
 const MAX_PASSAGES_PER_ITEM: usize = 3;
-const MIN_SIMILARITY: f32 = 0.4;
+/// Vector floor for passage retrieval. Passage embeddings score lower against a
+/// short query than the old item-level (summary) embeddings did, so this is
+/// intentionally lenient — precision is recovered by the keyword half of hybrid
+/// search, the graph filter, and the model's own "answerable" gate.
+const MIN_SIMILARITY: f32 = 0.25;
 const NO_RESULTS: &str =
     "Nothing in our shared history covers that yet. Keep sharing and I'll get smarter.";
 
