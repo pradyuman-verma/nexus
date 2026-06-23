@@ -9,6 +9,7 @@ use uuid::Uuid;
 /// One retrieved passage with its parent item's metadata.
 #[derive(Debug, Clone)]
 pub struct ChunkHit {
+    pub id: Uuid,
     pub item_id: Uuid,
     pub url: String,
     pub title: Option<String>,
@@ -65,7 +66,7 @@ pub async fn search(
     let qvec = Vector::from(query.to_vec());
     let rows: Vec<ChunkRow> = sqlx::query_as(
         r#"
-        SELECT c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
+        SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
                i.message_id, i.shared_at, c.content,
                1 - (c.embedding <=> $2) AS similarity
         FROM chunks c
@@ -103,7 +104,7 @@ pub async fn search_within_items(
     let qvec = Vector::from(query.to_vec());
     let rows: Vec<ChunkRow> = sqlx::query_as(
         r#"
-        SELECT c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
+        SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
                i.message_id, i.shared_at, c.content,
                1 - (c.embedding <=> $2) AS similarity
         FROM chunks c
@@ -117,6 +118,38 @@ pub async fn search_within_items(
     .bind(group_id)
     .bind(qvec)
     .bind(item_ids)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// Keyword (full-text) search over passages — the lexical half of hybrid search.
+/// `websearch_to_tsquery` tolerates arbitrary user input (no syntax errors), and
+/// `similarity` here carries `ts_rank` (used only for ordering in fusion).
+pub async fn keyword_search(
+    pool: &PgPool,
+    group_id: i64,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<ChunkHit>> {
+    let rows: Vec<ChunkRow> = sqlx::query_as(
+        r#"
+        SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
+               i.message_id, i.shared_at, c.content,
+               ts_rank(to_tsvector('english', c.content),
+                       websearch_to_tsquery('english', $2)) AS similarity
+        FROM chunks c
+        JOIN items i ON i.id = c.item_id
+        LEFT JOIN users u ON u.id = i.shared_by
+        WHERE c.group_id = $1
+          AND to_tsvector('english', c.content) @@ websearch_to_tsquery('english', $2)
+        ORDER BY similarity DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(group_id)
+    .bind(query)
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -164,6 +197,7 @@ pub struct MissingItem {
 
 #[derive(sqlx::FromRow)]
 struct ChunkRow {
+    id: Uuid,
     item_id: Uuid,
     url: String,
     title: Option<String>,
@@ -179,6 +213,7 @@ struct ChunkRow {
 impl From<ChunkRow> for ChunkHit {
     fn from(r: ChunkRow) -> Self {
         ChunkHit {
+            id: r.id,
             item_id: r.item_id,
             url: r.url,
             title: r.title,

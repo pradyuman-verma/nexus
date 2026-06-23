@@ -71,12 +71,21 @@ pub async fn handle(
     )
     .await;
 
-    // Chunk-level retrieval: search passages, then group them back under items.
-    let hits = db::chunks::search(&state.pool, group_id, &qvec, CHUNK_K, MIN_SIMILARITY).await?;
+    // Hybrid retrieval: vector (semantic) + keyword (lexical) passage search,
+    // fused with Reciprocal Rank Fusion. Keyword catches exact terms / proper
+    // nouns that embeddings miss; vector catches paraphrase.
+    let vector_hits = db::chunks::search(&state.pool, group_id, &qvec, CHUNK_K, MIN_SIMILARITY).await?;
+    let keyword_hits = db::chunks::keyword_search(&state.pool, group_id, query_text, CHUNK_K)
+        .await
+        .unwrap_or_default();
+    let (nv, nk) = (vector_hits.len(), keyword_hits.len());
+    let hits = rrf_fuse(vec![vector_hits, keyword_hits], CHUNK_K as usize);
     tracing::info!(
         group_id,
         user_id,
-        passages = hits.len(),
+        vector = nv,
+        keyword = nk,
+        fused = hits.len(),
         query = %snippet(query_text, 80),
         "ask"
     );
@@ -263,6 +272,32 @@ async fn expand_with_graph(
     added
 }
 
+/// Reciprocal Rank Fusion: merge ranked passage lists into one. A chunk's score
+/// is Σ 1/(k + rank) across the lists it appears in (k=60, the standard constant).
+/// Robust to the two lists using different score scales (cosine vs ts_rank).
+fn rrf_fuse(lists: Vec<Vec<crate::db::chunks::ChunkHit>>, limit: usize) -> Vec<crate::db::chunks::ChunkHit> {
+    use std::collections::HashMap;
+    const K: f32 = 60.0;
+    let mut scores: HashMap<uuid::Uuid, f32> = HashMap::new();
+    let mut by_id: HashMap<uuid::Uuid, crate::db::chunks::ChunkHit> = HashMap::new();
+
+    for list in lists {
+        for (rank, hit) in list.into_iter().enumerate() {
+            *scores.entry(hit.id).or_insert(0.0) += 1.0 / (K + rank as f32 + 1.0);
+            by_id.entry(hit.id).or_insert(hit);
+        }
+    }
+
+    let mut ids: Vec<uuid::Uuid> = by_id.keys().copied().collect();
+    ids.sort_by(|a, b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ids.truncate(limit);
+    ids.into_iter().filter_map(|id| by_id.remove(&id)).collect()
+}
+
 /// Group passage hits (already similarity-ordered) back under their source items,
 /// preserving rank, capped to `MAX_SOURCES` items and `MAX_PASSAGES_PER_ITEM` each.
 fn group_hits(hits: Vec<crate::db::chunks::ChunkHit>) -> Vec<Source> {
@@ -389,5 +424,30 @@ mod tests {
     fn out_of_range_citations_dropped() {
         let cited = cited_in_text("refs [1] [9] [2]", 3);
         assert_eq!(cited, vec![1, 2]);
+    }
+
+    fn hit(id: uuid::Uuid) -> crate::db::chunks::ChunkHit {
+        crate::db::chunks::ChunkHit {
+            id,
+            item_id: uuid::Uuid::new_v4(),
+            url: "u".into(),
+            title: None,
+            summary: None,
+            shared_by: None,
+            username: None,
+            message_id: None,
+            shared_at: chrono::Utc::now(),
+            content: "c".into(),
+            similarity: 0.0,
+        }
+    }
+
+    #[test]
+    fn rrf_ranks_shared_chunk_first_and_dedups() {
+        let (a, b, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        // `a` appears in both lists; `b` and `c` once each.
+        let fused = rrf_fuse(vec![vec![hit(a), hit(b)], vec![hit(c), hit(a)]], 10);
+        assert_eq!(fused.len(), 3, "duplicates should be merged");
+        assert_eq!(fused[0].id, a, "chunk in both lists ranks first");
     }
 }
