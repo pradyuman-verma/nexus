@@ -125,8 +125,12 @@ pub async fn search_within_items(
 }
 
 /// Keyword (full-text) search over passages — the lexical half of hybrid search.
-/// `websearch_to_tsquery` tolerates arbitrary user input (no syntax errors), and
-/// `similarity` here carries `ts_rank` (used only for ordering in fusion).
+///
+/// Uses OR semantics: `plainto_tsquery` ANDs terms, which is wrong for natural
+/// questions (no passage contains every word), so we rewrite `&` → `|` to match
+/// passages containing ANY significant term, ranked by `ts_rank`. Precision is
+/// recovered by RRF fusion + the model's answerability gate. `similarity` carries
+/// `ts_rank` (used only for fusion ordering).
 pub async fn keyword_search(
     pool: &PgPool,
     group_id: i64,
@@ -135,15 +139,18 @@ pub async fn keyword_search(
 ) -> Result<Vec<ChunkHit>> {
     let rows: Vec<ChunkRow> = sqlx::query_as(
         r#"
+        WITH q AS (
+            SELECT replace(plainto_tsquery('english', $2)::text, '&', '|')::tsquery AS tsq
+        )
         SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
                i.message_id, i.shared_at, c.content,
-               ts_rank(to_tsvector('english', c.content),
-                       websearch_to_tsquery('english', $2)) AS similarity
+               ts_rank(to_tsvector('english', c.content), (SELECT tsq FROM q)) AS similarity
         FROM chunks c
         JOIN items i ON i.id = c.item_id
         LEFT JOIN users u ON u.id = i.shared_by
         WHERE c.group_id = $1
-          AND to_tsvector('english', c.content) @@ websearch_to_tsquery('english', $2)
+          AND (SELECT tsq FROM q) != ''::tsquery
+          AND to_tsvector('english', c.content) @@ (SELECT tsq FROM q)
         ORDER BY similarity DESC
         LIMIT $3
         "#,
