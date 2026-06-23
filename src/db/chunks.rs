@@ -87,6 +87,42 @@ pub async fn search(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// Best-matching passages restricted to a specific set of items, with NO
+/// similarity floor — used by graph expansion to surface graph-connected items
+/// the vector search would otherwise have filtered out.
+pub async fn search_within_items(
+    pool: &PgPool,
+    group_id: i64,
+    query: &[f32],
+    item_ids: &[Uuid],
+    limit: i64,
+) -> Result<Vec<ChunkHit>> {
+    if item_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let qvec = Vector::from(query.to_vec());
+    let rows: Vec<ChunkRow> = sqlx::query_as(
+        r#"
+        SELECT c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
+               i.message_id, i.shared_at, c.content,
+               1 - (c.embedding <=> $2) AS similarity
+        FROM chunks c
+        JOIN items i ON i.id = c.item_id
+        LEFT JOIN users u ON u.id = i.shared_by
+        WHERE c.group_id = $1 AND c.embedding IS NOT NULL AND c.item_id = ANY($3)
+        ORDER BY c.embedding <=> $2 ASC
+        LIMIT $4
+        "#,
+    )
+    .bind(group_id)
+    .bind(qvec)
+    .bind(item_ids)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 /// Items that have no chunks yet (for backfilling pre-chunking ingests).
 pub async fn items_missing_chunks(
     pool: &PgPool,

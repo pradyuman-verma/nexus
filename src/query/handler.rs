@@ -80,10 +80,16 @@ pub async fn handle(
         query = %snippet(query_text, 80),
         "ask"
     );
-    let sources = group_hits(hits);
+    let mut sources = group_hits(hits);
+
+    // Graph-aware expansion: pull in items connected to entities named in the
+    // query, even if vector similarity missed them.
+    let graph_added = expand_with_graph(state, group_id, query_text, &qvec, &mut sources).await;
+
     if sources.is_empty() {
         return Ok(NO_RESULTS.to_string());
     }
+    tracing::info!(group_id, sources = sources.len(), graph_added, "ask context");
     let items: Vec<RetrievedItem> = sources.iter().map(|s| s.item.clone()).collect();
 
     // Tier 5: synthesize over the retrieved passages.
@@ -198,6 +204,63 @@ fn cited_in_text(text: &str, n: usize) -> Vec<usize> {
         }
     }
     sanitize_cited(&out, n)
+}
+
+/// Expand `sources` with items the graph connects to entities named in the query.
+/// Returns how many new sources were added.
+async fn expand_with_graph(
+    state: &AppState,
+    group_id: i64,
+    query_text: &str,
+    qvec: &[f32],
+    sources: &mut Vec<Source>,
+) -> usize {
+    if sources.len() >= MAX_SOURCES {
+        return 0;
+    }
+    let seeds = db::graph::entities_in_query(&state.pool, group_id, query_text, 8)
+        .await
+        .unwrap_or_default();
+    if seeds.is_empty() {
+        return 0;
+    }
+
+    // Seeds + one hop of related entities.
+    let mut entities = seeds.clone();
+    if let Ok(related) = db::graph::related_entities(&state.pool, group_id, &seeds, 12).await {
+        entities.extend(related);
+    }
+
+    let item_ids = db::graph::items_mentioning(&state.pool, group_id, &entities, 25)
+        .await
+        .unwrap_or_default();
+
+    let present: std::collections::HashSet<uuid::Uuid> =
+        sources.iter().map(|s| s.item.id).collect();
+    let new_ids: Vec<uuid::Uuid> = item_ids.into_iter().filter(|id| !present.contains(id)).collect();
+    if new_ids.is_empty() {
+        return 0;
+    }
+
+    let extra = db::chunks::search_within_items(
+        &state.pool,
+        group_id,
+        qvec,
+        &new_ids,
+        (MAX_SOURCES * MAX_PASSAGES_PER_ITEM) as i64,
+    )
+    .await
+    .unwrap_or_default();
+
+    let mut added = 0;
+    for src in group_hits(extra) {
+        if sources.len() >= MAX_SOURCES {
+            break;
+        }
+        sources.push(src);
+        added += 1;
+    }
+    added
 }
 
 /// Group passage hits (already similarity-ordered) back under their source items,

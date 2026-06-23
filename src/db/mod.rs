@@ -4,6 +4,7 @@
 pub mod chunks;
 pub mod edges;
 pub mod entities;
+pub mod graph;
 pub mod groups;
 pub mod items;
 pub mod notifications;
