@@ -1,7 +1,8 @@
 //! Slash-command handling: /ask /stats /threshold /help /mute /unmute.
 
-use crate::db;
-use crate::query;
+use crate::bot::formatter::esc;
+use crate::graph::builder;
+use crate::{db, query};
 use crate::state::AppState;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -17,6 +18,7 @@ when something genuinely relevant to your interests lands.\n\n\
 /threshold [0.0-1.0] — tune your notification sensitivity (lower = more pings)\n\
 /mute — pause your notifications for 24h\n\
 /unmute — resume notifications\n\
+/ping — quick health check\n\
 /help — this message\n\n\
 You can also just @mention me with a question.";
 
@@ -44,6 +46,8 @@ pub async fn try_handle(
         .unwrap_or("")
         .to_lowercase();
 
+    tracing::info!(command = %cmd, has_args = !args.is_empty(), chat_id, user_id, "rx command");
+
     let reply: String = match cmd.as_str() {
         "help" | "start" => HELP.to_string(),
         "ask" => query::handler::handle(state, chat_id, user_id, args).await?,
@@ -51,6 +55,15 @@ pub async fn try_handle(
         "threshold" => threshold(state, chat_id, user_id, args).await?,
         "mute" => mute(state, chat_id, user_id, true).await?,
         "unmute" => mute(state, chat_id, user_id, false).await?,
+        "ping" => ping(state, chat_id).await,
+        "buildgraph" => {
+            // Admin/test helper: build the graph now instead of waiting for the 6h cron.
+            let _ = state
+                .bot
+                .send_message(ChatId(chat_id), "🧠 Building the knowledge graph from unprocessed items… this can take a moment.")
+                .await;
+            buildgraph(state, chat_id).await?
+        }
         _ => return Ok(false), // unknown command — ignore silently
     };
 
@@ -71,6 +84,57 @@ async fn send(state: &AppState, chat_id: i64, reply_to: i32, text: &str) {
     if let Err(e) = res {
         tracing::warn!(error = %e, "sending command reply failed");
     }
+}
+
+/// Lightweight health check: confirms the bot is alive and the DB is reachable,
+/// and shows the active models.
+async fn ping(state: &AppState, chat_id: i64) -> String {
+    let db_line = match sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM items WHERE group_id = $1",
+    )
+    .bind(chat_id)
+    .fetch_one(&state.pool)
+    .await
+    {
+        Ok((n,)) => format!("DB: 🟢 ok ({n} items here)"),
+        Err(_) => "DB: 🔴 unreachable".to_string(),
+    };
+
+    format!(
+        "🟢 <b>Nexus is up.</b>\n{db_line}\nChat: <code>{}</code>\nEmbeddings: <code>{}</code>",
+        esc(&state.config.ollama_chat_model),
+        esc(&state.config.embedding_model),
+    )
+}
+
+/// Run the Tier 4 graph builder on demand and report what it produced.
+async fn buildgraph(state: &AppState, chat_id: i64) -> Result<String> {
+    let stats = builder::run(state, state.config.ingestion_batch_size).await?;
+
+    let entities = db::entities::recent(&state.pool, chat_id, 15)
+        .await
+        .unwrap_or_default();
+    let ent_list = if entities.is_empty() {
+        "—".to_string()
+    } else {
+        entities
+            .iter()
+            .map(|(name, type_)| format!("{name} ({type_})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    Ok(format!(
+        "🧠 <b>Knowledge graph updated</b>\n\n\
+         Items processed: <b>{}</b>\n\
+         Entities found: <b>{}</b>\n\
+         Edges created: <b>{}</b>\n\n\
+         <b>Known entities (this group):</b>\n{}",
+        stats.items,
+        stats.entities,
+        stats.edges,
+        esc(&ent_list),
+    ))
 }
 
 async fn threshold(state: &AppState, chat_id: i64, user_id: i64, args: &str) -> Result<String> {

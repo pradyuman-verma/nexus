@@ -32,6 +32,14 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
     let username = user.and_then(|u| u.username.clone());
     let first_name = user.map(|u| u.first_name.clone());
 
+    tracing::debug!(
+        chat_id,
+        user = ?username.as_deref().or(first_name.as_deref()),
+        message_id,
+        len = text.chars().count(),
+        "rx message"
+    );
+
     // 1. Persist group/user, buffer the message.
     db::groups::upsert_group(&state.pool, chat_id, msg.chat.title()).await?;
     if let Some(uid) = user_id {
@@ -55,6 +63,7 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
             return Ok(());
         }
         if let Some(query) = mention_query(state, text) {
+            tracing::info!(chat_id, user = uid, "rx @mention query");
             let reply = query::handler::handle(state, chat_id, uid, &query).await?;
             state
                 .bot
@@ -87,10 +96,11 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
             .await
             .unwrap_or(false)
         {
-            tracing::debug!(%url, "skipping duplicate url");
+            tracing::info!(%url, chat_id, "link shared (duplicate — skipped)");
             continue;
         }
 
+        tracing::info!(%url, chat_id, user = uid, "link shared — queued for ingestion");
         schedule_ingestion(
             state.clone(),
             url,
