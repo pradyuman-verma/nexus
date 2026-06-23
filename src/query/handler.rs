@@ -7,15 +7,21 @@ use crate::state::AppState;
 use anyhow::Result;
 use serde::Deserialize;
 
-const SYSTEM_PROMPT: &str = "You are Nexus, this group's collective memory. \
-Answer the user's question using ONLY the numbered sources provided. \
-Set \"answerable\" to false when the sources are off-topic or simply don't contain \
-the answer — do NOT stretch a loosely-related source into an answer. \
-Never invent facts that aren't in the sources. \
+const SYSTEM_PROMPT: &str = "You are Nexus — a sharp research analyst and this \
+group's collective memory. Using the group's shared sources, write an insightful, \
+synthesized answer to the question. Think like a researcher, not a search engine:\n\
+- Lead with the core thesis or through-line — not a list of restated points.\n\
+- Connect ideas ACROSS sources; note where they reinforce, complicate, or contradict each other.\n\
+- Surface what's non-obvious: implications, second-order effects, tensions, open questions.\n\
+- Be concise and substantive. Avoid shallow bullet-point summaries of each source.\n\
+Ground every factual claim in the sources and cite them as [n]; never invent facts, \
+numbers, or sources. You MAY add interpretation and connect dots beyond the literal \
+text, as long as the underlying facts trace to the sources. If the sources genuinely \
+can't support an answer, set \"answerable\" to false.\n\
 Return JSON only, no prose, in exactly this shape: \
 {\"answerable\": true|false, \
-\"answer\": \"1-3 short paragraphs citing sources as [1], [2]; empty string if not answerable\", \
-\"sources\": [the source numbers you actually used; empty if not answerable]}";
+\"answer\": \"your analysis, citing sources as [1], [2]; empty string if not answerable\", \
+\"sources\": [the source numbers you actually drew on; empty if not answerable]}";
 
 const TOP_K: i64 = 10;
 const MIN_SIMILARITY: f32 = 0.25;
@@ -124,6 +130,10 @@ fn parse_answer(raw: &str) -> Option<Tier5Answer> {
     None
 }
 
+/// How much actual article text to give the model per source. Distributed across
+/// the retrieved items, this keeps the prompt rich but bounded.
+const CONTENT_BUDGET_CHARS: usize = 2200;
+
 fn build_context(items: &[RetrievedItem]) -> String {
     let mut out = String::new();
     for (i, item) in items.iter().enumerate() {
@@ -148,9 +158,18 @@ fn build_context(items: &[RetrievedItem]) -> String {
             .filter(|t| !t.is_empty())
             .map(|t| format!("\n   conversation when shared: {}", snippet(&t, 280)))
             .unwrap_or_default();
+        // The actual article/transcript text — what lets the model reason instead
+        // of just restating the summary.
+        let content = item
+            .raw_content
+            .as_deref()
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+            .map(|c| format!("\n   content: {}", snippet(c, CONTENT_BUDGET_CHARS)))
+            .unwrap_or_default();
 
         out.push_str(&format!(
-            "[{n}] {label} ({url})\n   summary: {summary}{tags}\n   shared by {who} on {date}{ctx}\n\n",
+            "[{n}] {label} ({url})\n   shared by {who} on {date}{tags}\n   summary: {summary}{content}{ctx}\n\n",
             url = item.url,
         ));
     }

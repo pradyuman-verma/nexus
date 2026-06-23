@@ -93,7 +93,7 @@ pub async fn search(
     // 1 - cosine_distance == cosine_similarity
     let rows: Vec<ItemRow> = sqlx::query_as(
         r#"
-        SELECT i.id, i.url, i.title, i.summary, i.tags, i.category,
+        SELECT i.id, i.url, i.title, i.summary, i.raw_content, i.tags, i.category,
                i.context_window, i.shared_by, u.username, i.message_id, i.shared_at,
                1 - (i.embedding <=> $2) AS similarity
         FROM items i
@@ -229,6 +229,7 @@ struct ItemRow {
     url: String,
     title: Option<String>,
     summary: Option<String>,
+    raw_content: Option<String>,
     tags: Vec<String>,
     category: Option<String>,
     context_window: Option<serde_json::Value>,
@@ -246,6 +247,7 @@ impl From<ItemRow> for RetrievedItem {
             url: r.url,
             title: r.title,
             summary: r.summary,
+            raw_content: r.raw_content,
             tags: r.tags,
             category: r.category,
             context_window: r

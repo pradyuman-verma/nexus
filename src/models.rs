@@ -100,6 +100,7 @@ pub struct RetrievedItem {
     pub url: String,
     pub title: Option<String>,
     pub summary: Option<String>,
+    pub raw_content: Option<String>,
     pub tags: Vec<String>,
     pub category: Option<String>,
     pub context_window: Option<ContextWindow>,

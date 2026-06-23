@@ -129,7 +129,7 @@ impl Chat {
 
     // ── Tier 5: RAG synthesis ───────────────────────────────────────────────
     pub async fn synthesize(&self, system: &str, context_and_question: &str) -> Result<String> {
-        self.complete(Tier::Five, Some(system), context_and_question, 1500)
+        self.complete(Tier::Five, Some(system), context_and_question, 2000)
             .await
     }
 }
