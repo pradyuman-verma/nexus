@@ -56,6 +56,17 @@ pub async fn first_name(pool: &PgPool, id: i64) -> Result<Option<String>> {
     Ok(row.map(|(fname, uname)| fname.or(uname).unwrap_or_else(|| "Someone".to_string())))
 }
 
+/// Count buffered messages in a chat (for privacy nudge on first link).
+pub async fn buffer_count(pool: &PgPool, group_id: i64) -> Result<i64> {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM messages_buffer WHERE group_id = $1",
+    )
+    .bind(group_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
 /// Append a message to the rolling buffer.
 pub async fn buffer_message(
     pool: &PgPool,

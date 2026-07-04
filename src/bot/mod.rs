@@ -4,6 +4,7 @@ pub mod callbacks;
 pub mod commands;
 pub mod formatter;
 pub mod handler;
+pub mod member;
 
 use crate::state::AppState;
 use teloxide::prelude::*;
@@ -48,7 +49,8 @@ pub async fn run(state: AppState) {
 
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(handler::handle_message))
-        .branch(Update::filter_callback_query().endpoint(callbacks::handle_callback));
+        .branch(Update::filter_callback_query().endpoint(callbacks::handle_callback))
+        .branch(Update::filter_my_chat_member().endpoint(member::handle_my_chat_member));
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])

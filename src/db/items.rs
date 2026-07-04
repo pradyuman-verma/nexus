@@ -106,7 +106,7 @@ pub async fn search(
         r#"
         SELECT i.id, i.url, i.title, i.summary, i.raw_content, i.tags, i.category,
                i.context_window, i.shared_by, u.username, i.message_id, i.shared_at,
-               i.source_channel, i.content_type,
+               i.source_channel, i.content_type, i.group_id,
                1 - (i.embedding <=> $2) AS similarity
         FROM items i
         LEFT JOIN users u ON u.id = i.shared_by
@@ -262,6 +262,7 @@ struct ItemRow {
     shared_at: DateTime<Utc>,
     source_channel: Option<String>,
     content_type: Option<String>,
+    group_id: Option<i64>,
     similarity: Option<f64>,
 }
 
@@ -285,6 +286,7 @@ impl From<ItemRow> for RetrievedItem {
             similarity: r.similarity.unwrap_or(0.0) as f32,
             source_channel: r.source_channel,
             content_type: r.content_type,
+            group_id: r.group_id,
         }
     }
 }

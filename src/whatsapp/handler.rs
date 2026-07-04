@@ -124,7 +124,9 @@ async fn process_inner(state: &AppState, msg: &Message, profile_name: Option<Str
                 }
             } else if intake::is_question(text) {
                 tracing::info!(group_id, user = user_id, "whatsapp query");
-                let reply = query::handler::handle(state, group_id, user_id, text).await?;
+                let reply =
+                    query::handler::handle(state, group_id, user_id, query::QueryScope::Personal, text)
+                        .await?;
                 wa.send_text(&msg.from, &format::html_to_plain(&reply.html)).await?;
             } else {
                 intake::schedule_note(

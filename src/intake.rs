@@ -23,9 +23,32 @@ pub fn is_question(text: &str) -> bool {
     }
     let first = t.split_whitespace().next().unwrap_or("").to_lowercase();
     const OPENERS: &[&str] = &[
-        "what", "whats", "what's", "where", "which", "who", "when", "how", "why", "find",
-        "show", "search", "any", "got", "do", "does", "did", "is", "are", "was", "were",
-        "can", "could", "recommend", "suggest", "list",
+        "what",
+        "whats",
+        "what's",
+        "where",
+        "which",
+        "who",
+        "when",
+        "how",
+        "why",
+        "find",
+        "show",
+        "search",
+        "any",
+        "got",
+        "do",
+        "does",
+        "did",
+        "is",
+        "are",
+        "was",
+        "were",
+        "can",
+        "could",
+        "recommend",
+        "suggest",
+        "list",
     ];
     OPENERS.contains(&first.as_str())
 }
@@ -35,7 +58,10 @@ pub fn extract_urls(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for tok in text.split_whitespace() {
         let tok = tok.trim_matches(|c: char| {
-            matches!(c, '(' | ')' | '[' | ']' | '<' | '>' | ',' | '"' | '\'' | '.' | '!' | '?')
+            matches!(
+                c,
+                '(' | ')' | '[' | ']' | '<' | '>' | ',' | '"' | '\'' | '.' | '!' | '?'
+            )
         });
         if (tok.starts_with("http://") || tok.starts_with("https://"))
             && url::Url::parse(tok).is_ok()
@@ -100,17 +126,7 @@ pub async fn schedule_note(
     source_channel: &str,
 ) -> anyhow::Result<()> {
     let title = derive_title(&text, content_type);
-    let context_window = ContextWindow {
-        messages: vec![ContextMessage {
-            user_id: Some(shared_by),
-            username: None,
-            message_id,
-            text: text.chars().take(500).collect(),
-            position: ContextPosition::Pivot,
-        }],
-        forwarded,
-        forward_origin: None,
-    };
+    let context_window = build_context_window(state, group_id, message_id, forwarded, None).await;
 
     let job = IngestionJob {
         // Pseudo-URL: unique per capture, satisfies items.url NOT NULL and

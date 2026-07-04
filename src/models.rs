@@ -161,4 +161,6 @@ pub struct RetrievedItem {
     pub source_channel: Option<String>,
     /// note | voice | image | article | …
     pub content_type: Option<String>,
+    /// Telegram group / space where the item was captured.
+    pub group_id: Option<i64>,
 }

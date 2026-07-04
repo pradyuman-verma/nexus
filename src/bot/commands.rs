@@ -2,7 +2,7 @@
 
 use crate::bot::formatter::{self, esc};
 use crate::graph::builder;
-use crate::query::handler::QueryReply;
+use crate::query::handler::{QueryReply, QueryScope};
 use crate::state::AppState;
 use crate::{db, query};
 use anyhow::Result;
@@ -16,6 +16,7 @@ const HELP: &str = "<b>Nexus</b> — your personal second brain.\n\n\
 <b>Groups</b>: links are captured passively; notes/voice/photos need an @mention.\n\n\
 <b>Commands</b>\n\
 /ask [question] — search your personal brain (all channels)\n\
+/ask --here [question] — search only this chat's captures\n\
 /stats — captures + taste profile\n\
 /taste — liked/disliked tags, threshold, signal counts\n\
 /threshold [0.0-1.0] — tune relevance DM sensitivity (lower = more pings)\n\
@@ -35,7 +36,8 @@ I'm your personal second brain. Here's how I work:\n\n\
 Everything you send here (and on WhatsApp, if connected) builds <b>one brain</b> — \
 searchable across all channels.\n\n\
 <b>Ask questions</b>\n\
-<code>/ask what did I save about robotics?</code>\n\
+<code>/ask what did I save about robotics?</code> — your full brain\n\
+<code>/ask --here what links did we share?</code> — this chat only\n\
 Or just ask naturally in DM — I'll tell notes from questions.\n\n\
 <b>Relevance DMs</b>\n\
 When something shared in a group matches your interests, I can DM you. \
@@ -49,11 +51,22 @@ Try sharing a link or ask me something with <code>/ask</code>.";
 fn start_group(bot_username: &str) -> String {
     format!(
         "<b>Nexus</b> — your group's ambient memory.\n\n\
-         I passively capture <b>links</b> shared here and answer questions when @mentioned.\n\n\
+         I passively capture <b>links</b> shared here and answer questions when @mentioned.\n\
+         Use <code>/ask --here …</code> to search this chat; <code>/ask …</code> searches your personal brain.\n\n\
          For notes, voice memos, and photos, @mention me or \
          <a href=\"https://t.me/{bot_username}\">DM me directly</a>.\n\n\
          <code>/help</code> for commands."
     )
+}
+
+/// Parse `/ask [--here] question` into scope + question text.
+pub fn parse_ask_args(chat_id: i64, args: &str) -> (QueryScope, String) {
+    let trimmed = args.trim();
+    if let Some(rest) = trimmed.strip_prefix("--here") {
+        (QueryScope::Group(chat_id), rest.trim().to_string())
+    } else {
+        (QueryScope::Personal, trimmed.to_string())
+    }
 }
 
 /// Run a query with a typing indicator refreshed until the reply is ready.
@@ -61,6 +74,7 @@ pub async fn run_query(
     state: &AppState,
     chat_id: i64,
     user_id: i64,
+    scope: QueryScope,
     query_text: &str,
 ) -> Result<QueryReply> {
     let bot = state.bot.clone();
@@ -72,7 +86,7 @@ pub async fn run_query(
             tokio::time::sleep(Duration::from_secs(4)).await;
         }
     });
-    let result = query::handler::handle(state, chat_id, user_id, query_text).await;
+    let result = query::handler::handle(state, chat_id, user_id, scope, query_text).await;
     typing.abort();
     result
 }
@@ -133,7 +147,8 @@ pub async fn try_handle(
             }
         }
         "ask" => {
-            let reply = run_query(state, chat_id, user_id, args).await?;
+            let (scope, question) = parse_ask_args(chat_id, args);
+            let reply = run_query(state, chat_id, user_id, scope, &question).await?;
             send_query_reply(state, chat_id, reply_to, &reply).await;
             return Ok(true);
         }

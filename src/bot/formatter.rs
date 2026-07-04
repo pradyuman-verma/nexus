@@ -99,15 +99,27 @@ pub fn notification(
     )
 }
 
+/// Best link for a cited source: t.me deep link for TG captures, else the URL.
+pub fn source_link(item: &RetrievedItem) -> String {
+    let is_http = item.url.starts_with("http://") || item.url.starts_with("https://");
+    if item.source_channel.as_deref() == Some("telegram") {
+        if let (Some(gid), Some(mid)) = (item.group_id, item.message_id) {
+            if let Some(link) = message_link(gid, mid) {
+                return link;
+            }
+        }
+    }
+    if is_http {
+        item.url.clone()
+    } else {
+        item.url.clone()
+    }
+}
+
 /// Format a query answer, listing only the sources the model actually cited
 /// (`cited` holds 1-based indices into `items`). With no cited sources, the
 /// answer stands alone — no "Sources" dump.
-pub fn query_answer(
-    answer: &str,
-    items: &[RetrievedItem],
-    cited: &[usize],
-    chat_id: i64,
-) -> String {
+pub fn query_answer(answer: &str, items: &[RetrievedItem], cited: &[usize]) -> String {
     let mut out = esc(answer.trim());
     if cited.is_empty() {
         return out;
@@ -117,13 +129,9 @@ pub fn query_answer(
         let Some(item) = items.get(n - 1) else { continue };
         let label = esc(&item_label(item));
         let provenance = esc(&source_provenance(item));
-        let link = item
-            .message_id
-            .and_then(|m| message_link(chat_id, m))
-            .unwrap_or_else(|| item.url.clone());
+        let link = esc(&source_link(item));
         out.push_str(&format!(
-            "\n[{n}] <a href=\"{}\">{label}</a> ({provenance})",
-            esc(&link)
+            "\n[{n}] <a href=\"{link}\">{label}</a> ({provenance})"
         ));
     }
     out
@@ -163,12 +171,27 @@ mod tests {
             context_window: None,
             shared_by: None,
             shared_by_username: None,
-            message_id: None,
+            message_id: Some(42),
             shared_at: Utc::now(),
             similarity: 0.0,
             source_channel: Some(channel.into()),
             content_type: Some("article".into()),
+            group_id: Some(-100123456),
         }
+    }
+
+    #[test]
+    fn whatsapp_source_uses_url() {
+        let mut item = sample_item("whatsapp", "Voice note");
+        item.url = "https://example.com/article".into();
+        item.message_id = None;
+        assert_eq!(source_link(&item), "https://example.com/article");
+    }
+
+    #[test]
+    fn telegram_source_uses_deep_link() {
+        let item = sample_item("telegram", "Robotics fund");
+        assert!(source_link(&item).contains("t.me/c/"));
     }
 
     #[test]
@@ -181,7 +204,7 @@ mod tests {
     #[test]
     fn query_answer_shows_provenance() {
         let items = vec![sample_item("telegram", "Robotics fund")];
-        let out = query_answer("Answer [1].", &items, &[1], -100123);
+        let out = query_answer("Answer [1].", &items, &[1]);
         assert!(out.contains("Robotics fund"));
         assert!(out.contains("Telegram ·"));
         assert!(out.contains("[1]"));

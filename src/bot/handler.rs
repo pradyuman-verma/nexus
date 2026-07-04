@@ -11,6 +11,7 @@
 use crate::bot::commands;
 use crate::db;
 use crate::intake;
+use crate::query;
 use crate::state::AppState;
 use teloxide::net::Download;
 use teloxide::prelude::*;
@@ -55,6 +56,8 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
         db::groups::upsert_user(&state.pool, uid, username.as_deref(), first_name.as_deref())
             .await?;
     }
+
+    buffer_reply_parent(state, chat_id, msg).await?;
 
     let forwarded = is_forwarded(msg);
     let forward_origin = forward_origin(msg);
@@ -121,6 +124,9 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
         let Some(uid) = user_id else {
             return Ok(());
         };
+        if !in_private {
+            maybe_privacy_nudge(state, msg, chat_id).await?;
+        }
         let queued = schedule_urls(
             state,
             msg,
@@ -151,9 +157,16 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if intake::is_question(body) {
+    let (scope, question) = commands::parse_ask_args(chat_id, body);
+    let wants_query =
+        matches!(scope, query::QueryScope::Group(_)) || intake::is_question(&question);
+
+    if wants_query {
+        if question.is_empty() {
+            return Ok(());
+        }
         tracing::info!(chat_id, user = uid, "telegram query");
-        let reply = commands::run_query(state, chat_id, uid, body).await?;
+        let reply = commands::run_query(state, chat_id, uid, scope, &question).await?;
         commands::send_query_reply(state, chat_id, msg.id.0, &reply).await;
     } else {
         tracing::info!(chat_id, user = uid, "telegram note queued");
@@ -343,6 +356,46 @@ async fn download_voice(state: &AppState, voice: &teloxide::types::Voice) -> any
         .map(|m| m.to_string())
         .unwrap_or_else(|| "audio/ogg".to_string());
     Ok((bytes, mime))
+}
+
+async fn buffer_reply_parent(state: &AppState, chat_id: i64, msg: &Message) -> anyhow::Result<()> {
+    let Some(parent) = msg.reply_to_message() else {
+        return Ok(());
+    };
+    let text = parent.text().or_else(|| parent.caption()).unwrap_or("");
+    if text.is_empty() {
+        return Ok(());
+    }
+    let user = parent.from.as_ref();
+    let uid = user.map(|u| u.id.0 as i64);
+    let uname = user.and_then(|u| u.username.as_deref());
+    if let Some(uid) = uid {
+        db::groups::upsert_user(
+            &state.pool,
+            uid,
+            uname,
+            user.map(|u| u.first_name.as_str()),
+        )
+        .await?;
+    }
+    db::groups::buffer_message(
+        &state.pool,
+        chat_id,
+        uid,
+        uname,
+        parent.id.0 as i64,
+        Some(text),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn maybe_privacy_nudge(state: &AppState, msg: &Message, chat_id: i64) -> anyhow::Result<()> {
+    let count = db::groups::buffer_count(&state.pool, chat_id).await.unwrap_or(0);
+    if count == 0 {
+        crate::bot::member::send_privacy_nudge(state, msg.chat.id).await;
+    }
+    Ok(())
 }
 
 async fn capture_ack(state: &AppState, msg: &Message, text: &str) {

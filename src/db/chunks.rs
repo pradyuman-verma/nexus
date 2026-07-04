@@ -22,6 +22,7 @@ pub struct ChunkHit {
     pub similarity: f32,
     pub source_channel: Option<String>,
     pub content_type: Option<String>,
+    pub group_id: Option<i64>,
 }
 
 /// Replace an item's chunks with a fresh set. `rows` is `(index, content, embedding)`.
@@ -72,7 +73,7 @@ pub async fn search(
         r#"
         SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
                i.message_id, i.shared_at, c.content,
-               i.source_channel, i.content_type,
+               i.source_channel, i.content_type, i.group_id,
                1 - (c.embedding <=> $2) AS similarity
         FROM chunks c
         JOIN items i ON i.id = c.item_id
@@ -106,7 +107,7 @@ pub async fn search_by_owner(
         r#"
         SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
                i.message_id, i.shared_at, c.content,
-               i.source_channel, i.content_type,
+               i.source_channel, i.content_type, i.group_id,
                1 - (c.embedding <=> $2) AS similarity
         FROM chunks c
         JOIN items i ON i.id = c.item_id
@@ -141,7 +142,7 @@ pub async fn keyword_search_by_owner(
         )
         SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
                i.message_id, i.shared_at, c.content,
-               i.source_channel, i.content_type,
+               i.source_channel, i.content_type, i.group_id,
                ts_rank(to_tsvector('english', c.content), (SELECT tsq FROM q)) AS similarity
         FROM chunks c
         JOIN items i ON i.id = c.item_id
@@ -179,7 +180,7 @@ pub async fn search_within_items(
         r#"
         SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
                i.message_id, i.shared_at, c.content,
-               i.source_channel, i.content_type,
+               i.source_channel, i.content_type, i.group_id,
                1 - (c.embedding <=> $2) AS similarity
         FROM chunks c
         JOIN items i ON i.id = c.item_id
@@ -218,7 +219,7 @@ pub async fn keyword_search(
         )
         SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
                i.message_id, i.shared_at, c.content,
-               i.source_channel, i.content_type,
+               i.source_channel, i.content_type, i.group_id,
                ts_rank(to_tsvector('english', c.content), (SELECT tsq FROM q)) AS similarity
         FROM chunks c
         JOIN items i ON i.id = c.item_id
@@ -294,6 +295,7 @@ struct ChunkRow {
     content: String,
     source_channel: Option<String>,
     content_type: Option<String>,
+    group_id: Option<i64>,
     similarity: Option<f64>,
 }
 
@@ -313,6 +315,7 @@ impl From<ChunkRow> for ChunkHit {
             similarity: r.similarity.unwrap_or(0.0) as f32,
             source_channel: r.source_channel,
             content_type: r.content_type,
+            group_id: r.group_id,
         }
     }
 }

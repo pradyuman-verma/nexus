@@ -13,9 +13,37 @@ pub struct QueryReply {
     pub cited_item_ids: Vec<Uuid>,
 }
 
-const SYSTEM_PROMPT: &str = "You are Nexus — a sharp research analyst and this \
-group's collective memory. Using the group's shared sources, write an insightful, \
-synthesized answer to the question. Think like a researcher, not a search engine:\n\
+/// Personal brain (all channels) vs this chat only.
+#[derive(Debug, Clone, Copy)]
+pub enum QueryScope {
+    Personal,
+    Group(i64),
+}
+
+const SYSTEM_PROMPT_PERSONAL: &str = "You are Nexus — a sharp research analyst for \
+this user's personal second brain. Using their saved context across all channels \
+(Telegram, WhatsApp, etc.), write an insightful, synthesized answer to the question. \
+Think like a researcher, not a search engine:\n\
+- Lead with the core thesis or through-line — not a list of restated points.\n\
+- Connect ideas ACROSS sources; note where they reinforce, complicate, or contradict each other.\n\
+- Surface what's non-obvious: implications, second-order effects, tensions, open questions.\n\
+- Be concise and substantive. Avoid shallow bullet-point summaries of each source.\n\
+Ground every factual claim in the sources and cite them as [n]; never invent facts, \
+numbers, or sources. You MAY add interpretation and connect dots beyond the literal \
+text, as long as the underlying facts trace to the sources. If the sources genuinely \
+can't support an answer, set \"answerable\" to false and put 2-3 search queries that \
+WOULD locate the missing information into \"follow_up\".\n\
+Write the answer as plain text — no markdown (no **bold**, #headings, or backticks). \
+Return JSON only, no prose outside the JSON, in exactly this shape: \
+{\"answerable\": true|false, \
+\"answer\": \"your analysis, citing sources as [1], [2]; empty string if not answerable\", \
+\"sources\": [the source numbers you actually drew on; empty if not answerable], \
+\"follow_up\": [\"search queries to find missing info; empty when answerable\"]}";
+
+const SYSTEM_PROMPT_GROUP: &str = "You are Nexus — a sharp research analyst for \
+this Telegram group's shared captures. Using only items shared in this chat, write \
+an insightful, synthesized answer to the question. Think like a researcher, not a \
+search engine:\n\
 - Lead with the core thesis or through-line — not a list of restated points.\n\
 - Connect ideas ACROSS sources; note where they reinforce, complicate, or contradict each other.\n\
 - Surface what's non-obvious: implications, second-order effects, tensions, open questions.\n\
@@ -43,8 +71,10 @@ const MAX_PASSAGES_PER_ITEM: usize = 3;
 /// intentionally lenient — precision is recovered by the keyword half of hybrid
 /// search, the graph filter, and the model's own "answerable" gate.
 const MIN_SIMILARITY: f32 = 0.25;
-const NO_RESULTS: &str =
+const NO_RESULTS_PERSONAL: &str =
     "Nothing in your saved context covers that yet. Share links, notes, or voice memos and I'll get smarter.";
+const NO_RESULTS_GROUP: &str =
+    "Nothing shared in this chat covers that yet. Share a link here and I'll index it.";
 
 /// A source item with the passages that matched the query.
 struct Source {
@@ -55,8 +85,9 @@ struct Source {
 /// Handle a `/ask` / @mention query. Returns the HTML reply to send.
 pub async fn handle(
     state: &AppState,
-    group_id: i64,
+    chat_id: i64,
     user_id: i64,
+    scope: QueryScope,
     query_text: &str,
 ) -> Result<QueryReply> {
     let query_text = query_text.trim();
@@ -68,6 +99,11 @@ pub async fn handle(
         });
     }
 
+    let no_results = match scope {
+        QueryScope::Personal => NO_RESULTS_PERSONAL,
+        QueryScope::Group(_) => NO_RESULTS_GROUP,
+    };
+
     // Tier 3: embed the query (also the interest signal below).
     let qvec = state.embedder.embed(query_text).await?;
 
@@ -78,7 +114,11 @@ pub async fn handle(
         db::events::event_type::QUERY,
         None,
         3.0,
-        serde_json::json!({ "query": snippet(query_text, 120), "group_id": group_id }),
+        serde_json::json!({
+            "query": snippet(query_text, 120),
+            "chat_id": chat_id,
+            "scope": scope_label(scope),
+        }),
     )
     .await;
     let _ = db::taste::apply_signal(
@@ -112,52 +152,67 @@ pub async fn handle(
             embeds.push(e);
         }
     }
-    tracing::info!(group_id, user_id, probes = extra_probes.len(), query = %snippet(query_text, 80), "ask expand");
+    tracing::info!(
+        chat_id,
+        user_id,
+        scope = scope_label(scope),
+        probes = extra_probes.len(),
+        query = %snippet(query_text, 80),
+        "ask expand"
+    );
+
+    let taste = db::taste::get(&state.pool, user_id).await.ok().flatten();
+    let system_prompt = build_system_prompt(scope, taste.as_ref());
 
     // Retrieve (hybrid + graph), synthesize, and self-correct once if the model
     // says the corpus can't answer and offers follow-up queries.
     let mut keyword_query = query_text.to_string();
     for attempt in 0..2u8 {
-        let hits = hybrid_retrieve(state, user_id, &keyword_query, &embeds).await;
+        let hits = hybrid_retrieve(state, scope, user_id, &keyword_query, &embeds).await;
         let mut sources = group_hits(hits);
-        let graph_added = expand_with_graph(state, group_id, query_text, &qvec, &mut sources).await;
+        let graph_group = match scope {
+            QueryScope::Group(g) => g,
+            QueryScope::Personal => chat_id,
+        };
+        let graph_added =
+            expand_with_graph(state, graph_group, query_text, &qvec, &mut sources).await;
 
         if sources.is_empty() {
             return Ok(QueryReply {
-                html: NO_RESULTS.to_string(),
+                html: no_results.to_string(),
                 cited_item_ids: vec![],
             });
         }
-        tracing::info!(group_id, attempt, sources = sources.len(), graph_added, "ask context");
+        tracing::info!(chat_id, attempt, sources = sources.len(), graph_added, "ask context");
 
         let items: Vec<RetrievedItem> = sources.iter().map(|s| s.item.clone()).collect();
         let context = build_context(&sources);
         let user_msg = format!("Sources:\n{context}\n\nQuestion: {query_text}");
-        let raw = state.chat.synthesize(SYSTEM_PROMPT, &user_msg).await?;
+        let raw = state.chat.synthesize(&system_prompt, &user_msg).await?;
 
         match resolve_outcome(&raw, items.len()) {
             AnswerOutcome::Answered { answer, cited } => {
-                tracing::info!(group_id, attempt, answered = true, cited = cited.len(), "ask answered");
+                tracing::info!(chat_id, attempt, answered = true, cited = cited.len(), "ask answered");
                 let cited_item_ids: Vec<Uuid> = cited
                     .iter()
                     .filter_map(|n| items.get(n - 1).map(|i| i.id))
                     .collect();
                 return Ok(QueryReply {
-                    html: formatter::query_answer(&answer, &items, &cited, group_id),
+                    html: formatter::query_answer(&answer, &items, &cited),
                     cited_item_ids,
                 });
             }
             AnswerOutcome::NeedMore { follow_up } => {
                 // Out of retries, or no leads to chase → give up gracefully.
                 if attempt >= 1 || follow_up.is_empty() {
-                    tracing::info!(group_id, attempt, answered = false, "ask answered");
+                    tracing::info!(chat_id, attempt, answered = false, "ask answered");
                     return Ok(QueryReply {
-                        html: NO_RESULTS.to_string(),
+                        html: no_results.to_string(),
                         cited_item_ids: vec![],
                     });
                 }
                 // Second-pass retrieval targeting the gap the model flagged.
-                tracing::info!(group_id, follow_ups = follow_up.len(), "ask self-correcting");
+                tracing::info!(chat_id, follow_ups = follow_up.len(), "ask self-correcting");
                 for q in &follow_up {
                     if let Ok(e) = state.embedder.embed(q).await {
                         embeds.push(e);
@@ -169,32 +224,95 @@ pub async fn handle(
     }
 
     Ok(QueryReply {
-        html: NO_RESULTS.to_string(),
+        html: no_results.to_string(),
         cited_item_ids: vec![],
     })
+}
+
+fn scope_label(scope: QueryScope) -> &'static str {
+    match scope {
+        QueryScope::Personal => "personal",
+        QueryScope::Group(_) => "group",
+    }
+}
+
+fn build_system_prompt(scope: QueryScope, taste: Option<&crate::models::UserTasteProfile>) -> String {
+    let base = match scope {
+        QueryScope::Personal => SYSTEM_PROMPT_PERSONAL,
+        QueryScope::Group(_) => SYSTEM_PROMPT_GROUP,
+    };
+    let Some(t) = taste else {
+        return base.to_string();
+    };
+    if t.liked_tags.is_empty() && t.disliked_tags.is_empty() {
+        return base.to_string();
+    }
+    let liked = if t.liked_tags.is_empty() {
+        "—".to_string()
+    } else {
+        t.liked_tags.join(", ")
+    };
+    let disliked = if t.disliked_tags.is_empty() {
+        "—".to_string()
+    } else {
+        t.disliked_tags.join(", ")
+    };
+    format!(
+        "{base}\n\nUser taste hints (soft guidance, never override the sources): \
+         liked topics: {liked}; disliked topics: {disliked}."
+    )
 }
 
 /// Hybrid retrieval over multiple query embeddings: vector search per embedding
 /// + one keyword search, all fused with RRF.
 async fn hybrid_retrieve(
     state: &AppState,
-    owner_user_id: i64,
+    scope: QueryScope,
+    user_id: i64,
     keyword_query: &str,
     embeds: &[Vec<f32>],
 ) -> Vec<crate::db::chunks::ChunkHit> {
     let mut lists = Vec::new();
-    for e in embeds {
-        if let Ok(h) =
-            db::chunks::search_by_owner(&state.pool, owner_user_id, e, CHUNK_K, MIN_SIMILARITY).await
-        {
-            lists.push(h);
+    match scope {
+        QueryScope::Personal => {
+            for e in embeds {
+                if let Ok(h) = db::chunks::search_by_owner(
+                    &state.pool,
+                    user_id,
+                    e,
+                    CHUNK_K,
+                    MIN_SIMILARITY,
+                )
+                .await
+                {
+                    lists.push(h);
+                }
+            }
+            match db::chunks::keyword_search_by_owner(
+                &state.pool,
+                user_id,
+                keyword_query,
+                CHUNK_K,
+            )
+            .await
+            {
+                Ok(k) => lists.push(k),
+                Err(e) => tracing::debug!(error = %e, "keyword search failed"),
+            }
         }
-    }
-    match db::chunks::keyword_search_by_owner(&state.pool, owner_user_id, keyword_query, CHUNK_K)
-        .await
-    {
-        Ok(k) => lists.push(k),
-        Err(e) => tracing::debug!(error = %e, "keyword search failed"),
+        QueryScope::Group(group_id) => {
+            for e in embeds {
+                if let Ok(h) =
+                    db::chunks::search(&state.pool, group_id, e, CHUNK_K, MIN_SIMILARITY).await
+                {
+                    lists.push(h);
+                }
+            }
+            match db::chunks::keyword_search(&state.pool, group_id, keyword_query, CHUNK_K).await {
+                Ok(k) => lists.push(k),
+                Err(e) => tracing::debug!(error = %e, "keyword search failed"),
+            }
+        }
     }
     rrf_fuse(lists, CHUNK_K as usize)
 }
@@ -431,6 +549,7 @@ fn group_hits(hits: Vec<crate::db::chunks::ChunkHit>) -> Vec<Source> {
                     similarity: hit.similarity,
                     source_channel: hit.source_channel.clone(),
                     content_type: hit.content_type.clone(),
+                    group_id: hit.group_id,
                 },
                 passages: Vec::new(),
             }
@@ -563,6 +682,7 @@ mod tests {
             similarity: 0.0,
             source_channel: Some("telegram".into()),
             content_type: Some("article".into()),
+            group_id: Some(-100123),
         }
     }
 
