@@ -2,7 +2,7 @@
 
 use crate::bot::formatter::{self, esc};
 use crate::graph::builder;
-use crate::query::handler::{QueryReply, QueryScope};
+use crate::query::handler::{QueryAnchor, QueryReply, QueryScope, WebMode};
 use crate::state::AppState;
 use crate::{db, query};
 use anyhow::Result;
@@ -17,6 +17,8 @@ const HELP: &str = "<b>Nexus</b> — your personal second brain.\n\n\
 <b>Commands</b>\n\
 /ask [question] — search your personal brain (all channels)\n\
 /ask --here [question] — search only this chat's captures\n\
+/ask --web [question] — your brain + live web when needed\n\
+/ask --web-only [question] — web search only (no saved context)\n\
 /stats — captures + taste profile\n\
 /taste — liked/disliked tags, threshold, signal counts\n\
 /threshold [0.0-1.0] — tune relevance DM sensitivity (lower = more pings)\n\
@@ -38,6 +40,7 @@ searchable across all channels.\n\n\
 <b>Ask questions</b>\n\
 <code>/ask what did I save about robotics?</code> — your full brain\n\
 <code>/ask --here what links did we share?</code> — this chat only\n\
+<code>/ask --web latest news on topic X</code> — brain + web\n\
 Or just ask naturally in DM — I'll tell notes from questions.\n\n\
 <b>Relevance DMs</b>\n\
 When something shared in a group matches your interests, I can DM you. \
@@ -52,20 +55,50 @@ fn start_group(bot_username: &str) -> String {
     format!(
         "<b>Nexus</b> — your group's ambient memory.\n\n\
          I passively capture <b>links</b> shared here and answer questions when @mentioned.\n\
-         Use <code>/ask --here …</code> to search this chat; <code>/ask …</code> searches your personal brain.\n\n\
+         Use <code>/ask --here …</code> to search this chat; <code>/ask …</code> searches your personal brain.\n\
+         Add <code>--web</code> to pull live web results when your saves aren't enough.\n\n\
          For notes, voice memos, and photos, @mention me or \
          <a href=\"https://t.me/{bot_username}\">DM me directly</a>.\n\n\
          <code>/help</code> for commands."
     )
 }
 
-/// Parse `/ask [--here] question` into scope + question text.
-pub fn parse_ask_args(chat_id: i64, args: &str) -> (QueryScope, String) {
-    let trimmed = args.trim();
-    if let Some(rest) = trimmed.strip_prefix("--here") {
-        (QueryScope::Group(chat_id), rest.trim().to_string())
-    } else {
-        (QueryScope::Personal, trimmed.to_string())
+/// Parsed `/ask` flags + question text.
+pub struct AskRequest {
+    pub scope: QueryScope,
+    pub web: WebMode,
+    pub question: String,
+}
+
+/// Parse `/ask [--here] [--web-only|--web] question`.
+pub fn parse_ask_args(chat_id: i64, args: &str) -> AskRequest {
+    let mut scope = QueryScope::Personal;
+    let mut web = WebMode::Off;
+    let mut rest = args.trim();
+
+    loop {
+        if let Some(r) = rest.strip_prefix("--here") {
+            scope = QueryScope::Group(chat_id);
+            rest = r.trim();
+            continue;
+        }
+        if let Some(r) = rest.strip_prefix("--web-only") {
+            web = WebMode::Only;
+            rest = r.trim();
+            continue;
+        }
+        if let Some(r) = rest.strip_prefix("--web") {
+            web = WebMode::Augment;
+            rest = r.trim();
+            continue;
+        }
+        break;
+    }
+
+    AskRequest {
+        scope,
+        web,
+        question: rest.to_string(),
     }
 }
 
@@ -75,6 +108,8 @@ pub async fn run_query(
     chat_id: i64,
     user_id: i64,
     scope: QueryScope,
+    web: WebMode,
+    anchor: QueryAnchor,
     query_text: &str,
 ) -> Result<QueryReply> {
     let bot = state.bot.clone();
@@ -86,7 +121,16 @@ pub async fn run_query(
             tokio::time::sleep(Duration::from_secs(4)).await;
         }
     });
-    let result = query::handler::handle(state, chat_id, user_id, scope, query_text).await;
+    let result = query::handler::handle(
+        state,
+        chat_id,
+        user_id,
+        scope,
+        web,
+        anchor,
+        query_text,
+    )
+    .await;
     typing.abort();
     result
 }
@@ -116,6 +160,7 @@ pub async fn try_handle(
     chat_id: i64,
     user_id: i64,
     reply_to: i32,
+    reply_target_message_id: Option<i64>,
     text: &str,
     in_private: bool,
 ) -> Result<bool> {
@@ -147,8 +192,20 @@ pub async fn try_handle(
             }
         }
         "ask" => {
-            let (scope, question) = parse_ask_args(chat_id, args);
-            let reply = run_query(state, chat_id, user_id, scope, &question).await?;
+            let req = parse_ask_args(chat_id, args);
+            let anchor = QueryAnchor {
+                reply_message_id: reply_target_message_id,
+            };
+            let reply = run_query(
+                state,
+                chat_id,
+                user_id,
+                req.scope,
+                req.web,
+                anchor,
+                &req.question,
+            )
+            .await?;
             send_query_reply(state, chat_id, reply_to, &reply).await;
             return Ok(true);
         }
@@ -251,6 +308,11 @@ async fn ping(state: &AppState, user_id: i64) -> String {
     } else {
         "⚪ not configured"
     };
+    let web = if state.web_search.is_some() {
+        "🟢 on (--web / --web-only)"
+    } else {
+        "⚪ off (set TAVILY_API_KEY)"
+    };
 
     format!(
         "🟢 <b>Nexus is up.</b>\n\
@@ -262,7 +324,8 @@ async fn ping(state: &AppState, user_id: i64) -> String {
          <b>Capabilities</b>\n\
          Voice (STT): {stt}\n\
          Photo (vision): {vision}\n\
-         WhatsApp: {whatsapp}\n\n\
+         WhatsApp: {whatsapp}\n\
+         Web search: {web}\n\n\
          Chat model: <code>{}</code>\n\
          Embeddings: <code>{}</code>",
         threshold * 100.0,

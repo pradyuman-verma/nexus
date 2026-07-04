@@ -244,6 +244,61 @@ pub async fn signal_source(pool: &PgPool, id: Uuid) -> Result<Option<(Vec<f32>, 
     Ok(row.map(|(emb, tags)| (emb.map(|v| v.to_vec()).unwrap_or_default(), tags)))
 }
 
+/// Item captured from a specific Telegram message (reply-to anchor).
+pub async fn by_message(
+    pool: &PgPool,
+    group_id: i64,
+    message_id: i64,
+) -> Result<Option<RetrievedItem>> {
+    let row: Option<ItemRow> = sqlx::query_as(
+        r#"
+        SELECT i.id, i.url, i.title, i.summary, i.raw_content, i.tags, i.category,
+               i.context_window, i.shared_by, u.username, i.message_id, i.shared_at,
+               i.source_channel, i.content_type, i.group_id,
+               1.0 AS similarity
+        FROM items i
+        LEFT JOIN users u ON u.id = i.shared_by
+        WHERE i.group_id = $1 AND i.message_id = $2
+        ORDER BY i.shared_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(group_id)
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(Into::into))
+}
+
+/// Most recent capture by this user in a chat (for "this"/"that" without reply).
+pub async fn latest_in_chat(
+    pool: &PgPool,
+    group_id: i64,
+    owner_user_id: i64,
+    within_minutes: i64,
+) -> Result<Option<RetrievedItem>> {
+    let row: Option<ItemRow> = sqlx::query_as(
+        r#"
+        SELECT i.id, i.url, i.title, i.summary, i.raw_content, i.tags, i.category,
+               i.context_window, i.shared_by, u.username, i.message_id, i.shared_at,
+               i.source_channel, i.content_type, i.group_id,
+               1.0 AS similarity
+        FROM items i
+        LEFT JOIN users u ON u.id = i.shared_by
+        WHERE i.group_id = $1 AND i.owner_user_id = $2
+          AND i.shared_at > NOW() - ($3 || ' minutes')::interval
+        ORDER BY i.shared_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(group_id)
+    .bind(owner_user_id)
+    .bind(within_minutes.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(Into::into))
+}
+
 // ── internal row mapping ────────────────────────────────────────────────────
 
 #[derive(sqlx::FromRow)]

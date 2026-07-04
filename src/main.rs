@@ -11,6 +11,7 @@ use nexus::llm::ollama::Ollama;
 use nexus::llm::stt::Stt;
 use nexus::models::IngestionJob;
 use nexus::state::AppState;
+use nexus::search::TavilySearch;
 use nexus::whatsapp::WhatsApp;
 use nexus::{bot, cron, db, http, ingestion};
 use anyhow::{Context, Result};
@@ -86,6 +87,12 @@ async fn main() -> Result<()> {
             config.stt_model.clone(),
         ))
     });
+    let web_search = config.tavily_api_key.as_ref().map(|key| {
+        Arc::new(TavilySearch::new(
+            key.clone(),
+            config.web_search_max_results,
+        ))
+    });
 
     // ── Wiring ──────────────────────────────────────────────────────────────
     let (tx, rx) = mpsc::channel::<IngestionJob>(INGESTION_QUEUE_CAP);
@@ -100,6 +107,7 @@ async fn main() -> Result<()> {
         ingestion_tx: tx.clone(),
         wa,
         stt,
+        web_search,
     };
 
     // Ingestion consumer (continuous background task).

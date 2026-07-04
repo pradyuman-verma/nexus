@@ -1,3 +1,3 @@
 pub mod handler;
 
-pub use handler::QueryScope;
+pub use handler::{QueryAnchor, QueryScope, WebMode};

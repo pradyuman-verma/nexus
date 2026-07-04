@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::llm::chat::Chat;
 use crate::llm::embeddings::Embedder;
 use crate::llm::stt::Stt;
+use crate::search::TavilySearch;
 use crate::models::IngestionJob;
 use crate::whatsapp::WhatsApp;
 use sqlx::PgPool;
@@ -26,4 +27,6 @@ pub struct AppState {
     pub wa: Option<Arc<WhatsApp>>,
     /// Speech-to-text for voice note captures — None without STT_API_KEY.
     pub stt: Option<Arc<Stt>>,
+    /// Tavily web search — None without TAVILY_API_KEY.
+    pub web_search: Option<Arc<TavilySearch>>,
 }

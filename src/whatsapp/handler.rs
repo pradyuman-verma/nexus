@@ -124,9 +124,17 @@ async fn process_inner(state: &AppState, msg: &Message, profile_name: Option<Str
                 }
             } else if intake::is_question(text) {
                 tracing::info!(group_id, user = user_id, "whatsapp query");
-                let reply =
-                    query::handler::handle(state, group_id, user_id, query::QueryScope::Personal, text)
-                        .await?;
+                let req = crate::bot::commands::parse_ask_args(group_id, text);
+                let reply = query::handler::handle(
+                    state,
+                    group_id,
+                    user_id,
+                    query::QueryScope::Personal,
+                    req.web,
+                    query::QueryAnchor::default(),
+                    &req.question,
+                )
+                .await?;
                 wa.send_text(&msg.from, &format::html_to_plain(&reply.html)).await?;
             } else {
                 intake::schedule_note(

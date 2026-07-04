@@ -80,6 +80,11 @@ pub struct Config {
     pub taste_decay_lambda: f32,
     pub notification_score_log: bool,
     pub url_dedup_days: i64,
+
+    // ── Web search (/ask --web) ───────────────────────────────────────────
+    /// Tavily API key — enables `--web` augmentation when set.
+    pub tavily_api_key: Option<String>,
+    pub web_search_max_results: usize,
 }
 
 impl Config {
@@ -140,6 +145,11 @@ impl Config {
             taste_decay_lambda: opt("TASTE_DECAY_LAMBDA", "0.02").parse().unwrap_or(0.02),
             notification_score_log: opt("NOTIFICATION_SCORE_LOG", "true") == "true",
             url_dedup_days: opt("URL_DEDUP_DAYS", "7").parse().unwrap_or(7),
+
+            tavily_api_key: env::var("TAVILY_API_KEY").ok().filter(|s| !s.is_empty()),
+            web_search_max_results: opt("WEB_SEARCH_MAX_RESULTS", "5")
+                .parse()
+                .unwrap_or(5),
         })
     }
 

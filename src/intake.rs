@@ -53,6 +53,31 @@ pub fn is_question(text: &str) -> bool {
     OPENERS.contains(&first.as_str())
 }
 
+/// Question refers to something just shared ("this link", "what do you think")?
+pub fn is_deictic_query(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    if t.is_empty() {
+        return false;
+    }
+    const PHRASES: &[&str] = &[
+        "this",
+        "that",
+        "it",
+        "the link",
+        "the article",
+        "the post",
+        "the video",
+        "the note",
+        "the photo",
+        "what i just",
+        "what i shared",
+        "what we just",
+        "just shared",
+        "just sent",
+    ];
+    PHRASES.iter().any(|p| t.contains(p))
+}
+
 /// Extract http(s) URLs from free text (whitespace-token scan + validation).
 pub fn extract_urls(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -228,5 +253,12 @@ mod tests {
         assert!(is_question("that pasta recipe?"));
         assert!(!is_question("great pasta at Roscioli, get the carbonara"));
         assert!(!is_question(""));
+    }
+
+    #[test]
+    fn deictic_queries_detected() {
+        assert!(is_deictic_query("what do you think about this?"));
+        assert!(is_deictic_query("thoughts on that link"));
+        assert!(!is_deictic_query("what have we saved on robotics?"));
     }
 }

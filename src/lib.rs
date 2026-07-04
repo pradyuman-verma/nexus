@@ -21,5 +21,6 @@ pub mod llm;
 pub mod models;
 pub mod query;
 pub mod scorer;
+pub mod search;
 pub mod state;
 pub mod whatsapp;

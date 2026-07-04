@@ -119,12 +119,17 @@ pub fn source_link(item: &RetrievedItem) -> String {
 /// Format a query answer, listing only the sources the model actually cited
 /// (`cited` holds 1-based indices into `items`). With no cited sources, the
 /// answer stands alone — no "Sources" dump.
-pub fn query_answer(answer: &str, items: &[RetrievedItem], cited: &[usize]) -> String {
+pub fn query_answer(
+    answer: &str,
+    items: &[RetrievedItem],
+    cited: &[usize],
+    web: &[crate::search::WebSnippet],
+    web_cited: &[usize],
+) -> String {
     let mut out = esc(answer.trim());
-    if cited.is_empty() {
-        return out;
+    if !cited.is_empty() || !web_cited.is_empty() {
+        out.push_str("\n\n<b>Sources:</b>");
     }
-    out.push_str("\n\n<b>Sources:</b>");
     for &n in cited {
         let Some(item) = items.get(n - 1) else { continue };
         let label = esc(&item_label(item));
@@ -132,6 +137,14 @@ pub fn query_answer(answer: &str, items: &[RetrievedItem], cited: &[usize]) -> S
         let link = esc(&source_link(item));
         out.push_str(&format!(
             "\n[{n}] <a href=\"{link}\">{label}</a> ({provenance})"
+        ));
+    }
+    for &n in web_cited {
+        let Some(snippet) = web.get(n - 1) else { continue };
+        let label = esc(&snippet.title);
+        let link = esc(&snippet.url);
+        out.push_str(&format!(
+            "\n[W{n}] <a href=\"{link}\">{label}</a> (Web)"
         ));
     }
     out
@@ -204,7 +217,7 @@ mod tests {
     #[test]
     fn query_answer_shows_provenance() {
         let items = vec![sample_item("telegram", "Robotics fund")];
-        let out = query_answer("Answer [1].", &items, &[1]);
+        let out = query_answer("Answer [1].", &items, &[1], &[], &[]);
         assert!(out.contains("Robotics fund"));
         assert!(out.contains("Telegram ·"));
         assert!(out.contains("[1]"));

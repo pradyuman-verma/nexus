@@ -2,7 +2,9 @@
 
 use crate::bot::formatter;
 use crate::db;
+use crate::llm::chat::QueryIntent;
 use crate::models::RetrievedItem;
+use crate::search::WebSnippet;
 use crate::state::AppState;
 use anyhow::Result;
 use uuid::Uuid;
@@ -18,6 +20,24 @@ pub struct QueryReply {
 pub enum QueryScope {
     Personal,
     Group(i64),
+}
+
+/// Whether /ask may pull live web results (requires TAVILY_API_KEY).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WebMode {
+    #[default]
+    Off,
+    /// Closed corpus first; fetch web when the model flags a gap.
+    Augment,
+    /// Skip saved context; answer from web only.
+    Only,
+}
+
+/// Optional reply-to anchor — when the user asks about "this" / replies to a capture.
+#[derive(Debug, Clone, Default)]
+pub struct QueryAnchor {
+    /// Telegram message id of the capture being asked about (from reply_to).
+    pub reply_message_id: Option<i64>,
 }
 
 const SYSTEM_PROMPT_PERSONAL: &str = "You are Nexus — a sharp research analyst for \
@@ -38,6 +58,8 @@ Return JSON only, no prose outside the JSON, in exactly this shape: \
 {\"answerable\": true|false, \
 \"answer\": \"your analysis, citing sources as [1], [2]; empty string if not answerable\", \
 \"sources\": [the source numbers you actually drew on; empty if not answerable], \
+\"needs_external\": false, \
+\"external_queries\": [\"web search queries if outside info is required; empty otherwise\"], \
 \"follow_up\": [\"search queries to find missing info; empty when answerable\"]}";
 
 const SYSTEM_PROMPT_GROUP: &str = "You are Nexus — a sharp research analyst for \
@@ -58,7 +80,26 @@ Return JSON only, no prose outside the JSON, in exactly this shape: \
 {\"answerable\": true|false, \
 \"answer\": \"your analysis, citing sources as [1], [2]; empty string if not answerable\", \
 \"sources\": [the source numbers you actually drew on; empty if not answerable], \
+\"needs_external\": false, \
+\"external_queries\": [\"web search queries if outside info is required; empty otherwise\"], \
 \"follow_up\": [\"search queries to find missing info; empty when answerable\"]}";
+
+const SYSTEM_PROMPT_DUAL: &str = "You are Nexus — a sharp research analyst. You have \
+TWO source blocks: INTERNAL (the user's saved context) and EXTERNAL (live web snippets). \
+INTERNAL is ground truth for what this user/group actually saved; EXTERNAL is supplementary \
+and may be less trusted — label your reasoning clearly.\n\
+- Lead with the core thesis; connect ideas across sources.\n\
+- Cite INTERNAL sources as [1], [2], … and EXTERNAL as [W1], [W2], …\n\
+- Prefer INTERNAL when both cover the same fact; use EXTERNAL for gaps, recency, or breadth.\n\
+- Never invent facts. If neither block can answer, set \"answerable\" to false.\n\
+Write plain text — no markdown. Return JSON only: \
+{\"answerable\": true|false, \
+\"answer\": \"analysis citing [n] and [Wn] as appropriate\", \
+\"sources\": [internal numbers used], \
+\"web_sources\": [\"W1\", \"W2\" external markers used], \
+\"follow_up\": []}";
+
+const WEB_UNAVAILABLE: &str = "Web search isn't configured — add <code>TAVILY_API_KEY</code> to enable <code>--web</code>.";
 
 /// How many passages to pull before grouping them back under their items.
 const CHUNK_K: i64 = 16;
@@ -88,6 +129,8 @@ pub async fn handle(
     chat_id: i64,
     user_id: i64,
     scope: QueryScope,
+    web: WebMode,
+    anchor: QueryAnchor,
     query_text: &str,
 ) -> Result<QueryReply> {
     let query_text = query_text.trim();
@@ -99,13 +142,45 @@ pub async fn handle(
         });
     }
 
+    if web == WebMode::Only {
+        return handle_web_only(state, query_text).await;
+    }
+
+    let anchor_item = resolve_anchor(state, chat_id, user_id, &anchor, query_text).await;
+    let focused = anchor_item.is_some()
+        && (anchor.reply_message_id.is_some() || crate::intake::is_deictic_query(query_text));
+    if focused {
+        tracing::info!(
+            chat_id,
+            user_id,
+            item = ?anchor_item.as_ref().map(|i| i.id),
+            reply = ?anchor.reply_message_id,
+            "ask anchored"
+        );
+    }
+
+    let intent = if web == WebMode::Augment && state.web_search.is_some() && !focused {
+        state
+            .chat
+            .classify_query_intent(query_text)
+            .await
+            .unwrap_or_default()
+    } else {
+        QueryIntent::default()
+    };
+
     let no_results = match scope {
         QueryScope::Personal => NO_RESULTS_PERSONAL,
         QueryScope::Group(_) => NO_RESULTS_GROUP,
     };
 
     // Tier 3: embed the query (also the interest signal below).
-    let qvec = state.embedder.embed(query_text).await?;
+    let embed_text = if let Some(item) = &anchor_item {
+        anchor_aware_query(query_text, item)
+    } else {
+        query_text.to_string()
+    };
+    let qvec = state.embedder.embed(&embed_text).await?;
 
     // Querying is the strongest interest signal (weight 3.0).
     let _ = db::events::log(
@@ -138,15 +213,20 @@ pub async fn handle(
 
     // Multi-query / HyDE: expand the question into extra probes + a hypothetical
     // answer, embed them all, and retrieve over the union (failure-tolerant —
-    // falls back to just the original query).
-    let expansion = state.chat.expand_query(query_text).await.unwrap_or_default();
+    // falls back to just the original query). Skip when anchored — broad expansion
+    // pulls in unrelated corpus items.
     let mut embeds = vec![qvec.clone()];
-    let extra_probes: Vec<String> = expansion
-        .probes
-        .into_iter()
-        .chain(std::iter::once(expansion.hyde))
-        .filter(|p| !p.trim().is_empty())
-        .collect();
+    let extra_probes: Vec<String> = if focused {
+        Vec::new()
+    } else {
+        let expansion = state.chat.expand_query(&embed_text).await.unwrap_or_default();
+        expansion
+            .probes
+            .into_iter()
+            .chain(std::iter::once(expansion.hyde))
+            .filter(|p| !p.trim().is_empty())
+            .collect()
+    };
     for probe in &extra_probes {
         if let Ok(e) = state.embedder.embed(probe).await {
             embeds.push(e);
@@ -162,22 +242,38 @@ pub async fn handle(
     );
 
     let taste = db::taste::get(&state.pool, user_id).await.ok().flatten();
-    let system_prompt = build_system_prompt(scope, taste.as_ref());
+    let system_prompt = build_system_prompt(scope, taste.as_ref(), focused);
 
     // Retrieve (hybrid + graph), synthesize, and self-correct once if the model
     // says the corpus can't answer and offers follow-up queries.
-    let mut keyword_query = query_text.to_string();
+    let mut keyword_query = embed_text.clone();
     for attempt in 0..2u8 {
-        let hits = hybrid_retrieve(state, scope, user_id, &keyword_query, &embeds).await;
-        let mut sources = group_hits(hits);
-        let graph_group = match scope {
-            QueryScope::Group(g) => g,
-            QueryScope::Personal => chat_id,
+        let mut sources = if let Some(item) = anchor_item.as_ref().filter(|_| focused) {
+            anchor_sources(state, scope, user_id, item, &embeds).await
+        } else {
+            let hits = hybrid_retrieve(state, scope, user_id, &keyword_query, &embeds).await;
+            group_hits(hits)
         };
-        let graph_added =
-            expand_with_graph(state, graph_group, query_text, &qvec, &mut sources).await;
+        let graph_added = if focused {
+            0
+        } else {
+            let graph_group = match scope {
+                QueryScope::Group(g) => g,
+                QueryScope::Personal => chat_id,
+            };
+            expand_with_graph(state, graph_group, query_text, &qvec, &mut sources).await
+        };
 
         if sources.is_empty() {
+            if web == WebMode::Augment && state.web_search.is_some() {
+                return augment_with_web(
+                    state,
+                    query_text,
+                    &[],
+                    vec![query_text.to_string()],
+                )
+                .await;
+            }
             return Ok(QueryReply {
                 html: no_results.to_string(),
                 cited_item_ids: vec![],
@@ -187,23 +283,61 @@ pub async fn handle(
 
         let items: Vec<RetrievedItem> = sources.iter().map(|s| s.item.clone()).collect();
         let context = build_context(&sources);
-        let user_msg = format!("Sources:\n{context}\n\nQuestion: {query_text}");
+        let user_msg = if focused {
+            format!(
+                "The user is asking about the specific capture marked [1] (ANCHOR).\n\
+                 Sources:\n{context}\n\nQuestion: {query_text}"
+            )
+        } else {
+            format!("Sources:\n{context}\n\nQuestion: {query_text}")
+        };
         let raw = state.chat.synthesize(&system_prompt, &user_msg).await?;
 
         match resolve_outcome(&raw, items.len()) {
-            AnswerOutcome::Answered { answer, cited } => {
+            AnswerOutcome::Answered {
+                answer,
+                cited,
+                needs_external,
+                external_queries,
+            } => {
+                if web == WebMode::Augment
+                    && state.web_search.is_some()
+                    && needs_external
+                {
+                    let queries = merge_web_queries(
+                        query_text,
+                        &external_queries,
+                        &[],
+                        &intent.web_queries,
+                    );
+                    tracing::info!(chat_id, web_queries = queries.len(), "ask web augment");
+                    return augment_with_web(state, query_text, &sources, queries).await;
+                }
                 tracing::info!(chat_id, attempt, answered = true, cited = cited.len(), "ask answered");
                 let cited_item_ids: Vec<Uuid> = cited
                     .iter()
                     .filter_map(|n| items.get(n - 1).map(|i| i.id))
                     .collect();
                 return Ok(QueryReply {
-                    html: formatter::query_answer(&answer, &items, &cited),
+                    html: formatter::query_answer(&answer, &items, &cited, &[], &[]),
                     cited_item_ids,
                 });
             }
-            AnswerOutcome::NeedMore { follow_up } => {
-                // Out of retries, or no leads to chase → give up gracefully.
+            AnswerOutcome::NeedMore {
+                follow_up,
+                external_queries,
+                ..
+            } => {
+                if web == WebMode::Augment && state.web_search.is_some() {
+                    let queries = merge_web_queries(
+                        query_text,
+                        &follow_up,
+                        &external_queries,
+                        &intent.web_queries,
+                    );
+                    tracing::info!(chat_id, web_queries = queries.len(), "ask web augment");
+                    return augment_with_web(state, query_text, &sources, queries).await;
+                }
                 if attempt >= 1 || follow_up.is_empty() {
                     tracing::info!(chat_id, attempt, answered = false, "ask answered");
                     return Ok(QueryReply {
@@ -211,7 +345,6 @@ pub async fn handle(
                         cited_item_ids: vec![],
                     });
                 }
-                // Second-pass retrieval targeting the gap the model flagged.
                 tracing::info!(chat_id, follow_ups = follow_up.len(), "ask self-correcting");
                 for q in &follow_up {
                     if let Ok(e) = state.embedder.embed(q).await {
@@ -229,6 +362,226 @@ pub async fn handle(
     })
 }
 
+async fn handle_web_only(
+    state: &AppState,
+    query_text: &str,
+) -> Result<QueryReply> {
+    let Some(search) = state.web_search.as_ref() else {
+        return Ok(QueryReply {
+            html: WEB_UNAVAILABLE.to_string(),
+            cited_item_ids: vec![],
+        });
+    };
+    let snippets = search.search(query_text).await.unwrap_or_default();
+    if snippets.is_empty() {
+        return Ok(QueryReply {
+            html: "Web search returned no results for that question.".to_string(),
+            cited_item_ids: vec![],
+        });
+    }
+    synthesize_dual_reply(state, query_text, &[], &snippets).await
+}
+
+async fn augment_with_web(
+    state: &AppState,
+    query_text: &str,
+    sources: &[Source],
+    mut queries: Vec<String>,
+) -> Result<QueryReply> {
+    let Some(search) = state.web_search.as_ref() else {
+        return Ok(QueryReply {
+            html: WEB_UNAVAILABLE.to_string(),
+            cited_item_ids: vec![],
+        });
+    };
+    if queries.is_empty() {
+        queries.push(query_text.to_string());
+    }
+    let cap = state.config.web_search_max_results;
+    let snippets = search.search_many(&queries, cap).await.unwrap_or_default();
+    if snippets.is_empty() && sources.is_empty() {
+        return Ok(QueryReply {
+            html: NO_RESULTS_PERSONAL.to_string(),
+            cited_item_ids: vec![],
+        });
+    }
+    synthesize_dual_reply(state, query_text, sources, &snippets).await
+}
+
+async fn synthesize_dual_reply(
+    state: &AppState,
+    query_text: &str,
+    sources: &[Source],
+    snippets: &[WebSnippet],
+) -> Result<QueryReply> {
+    let items: Vec<RetrievedItem> = sources.iter().map(|s| s.item.clone()).collect();
+    let internal = if sources.is_empty() {
+        "(none)\n".to_string()
+    } else {
+        build_context(sources)
+    };
+    let external = build_web_context(snippets);
+    let user_msg = format!(
+        "INTERNAL SOURCES (saved context):\n{internal}\n\n\
+         EXTERNAL SOURCES (web — supplementary):\n{external}\n\n\
+         Question: {query_text}"
+    );
+    let raw = state.chat.synthesize(SYSTEM_PROMPT_DUAL, &user_msg).await?;
+    let DualOutcome {
+        answer,
+        cited,
+        web_cited,
+    } = resolve_dual_outcome(&raw, items.len(), snippets.len());
+    if answer.trim().is_empty() {
+        return Ok(QueryReply {
+            html: "Couldn't synthesize an answer from the available sources.".to_string(),
+            cited_item_ids: vec![],
+        });
+    }
+    let cited_item_ids: Vec<Uuid> = cited
+        .iter()
+        .filter_map(|n| items.get(n - 1).map(|i| i.id))
+        .collect();
+    Ok(QueryReply {
+        html: formatter::query_answer(&answer, &items, &cited, snippets, &web_cited),
+        cited_item_ids,
+    })
+}
+
+fn merge_web_queries(
+    question: &str,
+    a: &[String],
+    b: &[String],
+    intent_queries: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for q in intent_queries.iter().chain(a.iter()).chain(b.iter()) {
+        let q = q.trim();
+        if q.is_empty() || !seen.insert(q.to_lowercase()) {
+            continue;
+        }
+        out.push(q.to_string());
+    }
+    if out.is_empty() {
+        out.push(question.to_string());
+    }
+    out.truncate(3);
+    out
+}
+
+fn build_web_context(snippets: &[WebSnippet]) -> String {
+    let mut out = String::new();
+    for (i, s) in snippets.iter().enumerate() {
+        let n = i + 1;
+        let snippet = snippet(&s.content, 400);
+        out.push_str(&format!(
+            "[W{n}] {} ({}) — web\n   \"…{snippet}…\"\n\n",
+            s.title, s.url
+        ));
+    }
+    out
+}
+
+fn resolve_dual_outcome(raw: &str, n_internal: usize, n_web: usize) -> DualOutcome {
+    let cleaned = strip_fences(raw);
+    let json: Option<serde_json::Value> = serde_json::from_str(cleaned).ok().or_else(|| {
+        let (s, e) = (cleaned.find('{'), cleaned.rfind('}'));
+        match (s, e) {
+            (Some(s), Some(e)) if e > s => serde_json::from_str(&cleaned[s..=e]).ok(),
+            _ => None,
+        }
+    });
+    if let Some(v) = json {
+        if v.get("answerable").and_then(serde_json::Value::as_bool) == Some(false) {
+            return DualOutcome {
+                answer: String::new(),
+                cited: vec![],
+                web_cited: vec![],
+            };
+        }
+        if let Some(answer) = v
+            .get("answer")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let cited = sanitize_cited(
+                &v.get("sources")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(serde_json::Value::as_u64)
+                            .map(|x| x as usize)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                n_internal,
+            );
+            let cited = if cited.is_empty() {
+                cited_in_text(answer, n_internal)
+            } else {
+                cited
+            };
+            let explicit_web: Vec<usize> = v
+                .get("web_sources")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| {
+                            x.as_str()
+                                .and_then(parse_web_marker)
+                                .or_else(|| x.as_u64().map(|n| n as usize))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let web_cited = sanitize_cited(&explicit_web, n_web);
+            let web_cited = if web_cited.is_empty() {
+                cited_web_in_text(answer, n_web)
+            } else {
+                web_cited
+            };
+            return DualOutcome {
+                answer: answer.to_string(),
+                cited,
+                web_cited,
+            };
+        }
+    }
+    let prose = cleaned.trim();
+    DualOutcome {
+        answer: prose.to_string(),
+        cited: cited_in_text(prose, n_internal),
+        web_cited: cited_web_in_text(prose, n_web),
+    }
+}
+
+fn parse_web_marker(s: &str) -> Option<usize> {
+    let s = s.trim().trim_start_matches(['[', 'w', 'W']).trim_end_matches(']');
+    s.parse().ok()
+}
+
+fn cited_web_in_text(text: &str, n: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let upper = text.to_uppercase();
+    let mut rest = upper.as_str();
+    while let Some(open) = rest.find("[W") {
+        rest = &rest[open + 2..];
+        if let Some(close) = rest.find(']') {
+            if let Ok(k) = rest[..close].trim().parse::<usize>() {
+                if k >= 1 && k <= n {
+                    out.push(k);
+                }
+            }
+            rest = &rest[close + 1..];
+        } else {
+            break;
+        }
+    }
+    sanitize_cited(&out, n)
+}
+
 fn scope_label(scope: QueryScope) -> &'static str {
     match scope {
         QueryScope::Personal => "personal",
@@ -236,16 +589,29 @@ fn scope_label(scope: QueryScope) -> &'static str {
     }
 }
 
-fn build_system_prompt(scope: QueryScope, taste: Option<&crate::models::UserTasteProfile>) -> String {
+fn build_system_prompt(
+    scope: QueryScope,
+    taste: Option<&crate::models::UserTasteProfile>,
+    anchored: bool,
+) -> String {
     let base = match scope {
         QueryScope::Personal => SYSTEM_PROMPT_PERSONAL,
         QueryScope::Group(_) => SYSTEM_PROMPT_GROUP,
     };
+    let mut out = if anchored {
+        format!(
+            "{base}\n\nIMPORTANT: The user pointed at a specific capture (ANCHOR, source [1]). \
+             Answer primarily about that item. Do not synthesize unrelated sources unless \
+             the question explicitly asks for comparison."
+        )
+    } else {
+        base.to_string()
+    };
     let Some(t) = taste else {
-        return base.to_string();
+        return out;
     };
     if t.liked_tags.is_empty() && t.disliked_tags.is_empty() {
-        return base.to_string();
+        return out;
     }
     let liked = if t.liked_tags.is_empty() {
         "—".to_string()
@@ -257,10 +623,100 @@ fn build_system_prompt(scope: QueryScope, taste: Option<&crate::models::UserTast
     } else {
         t.disliked_tags.join(", ")
     };
-    format!(
-        "{base}\n\nUser taste hints (soft guidance, never override the sources): \
+    out.push_str(&format!(
+        "\n\nUser taste hints (soft guidance, never override the sources): \
          liked topics: {liked}; disliked topics: {disliked}."
-    )
+    ));
+    out
+}
+
+async fn resolve_anchor(
+    state: &AppState,
+    chat_id: i64,
+    user_id: i64,
+    anchor: &QueryAnchor,
+    query_text: &str,
+) -> Option<RetrievedItem> {
+    if let Some(mid) = anchor.reply_message_id {
+        if let Ok(Some(item)) = db::items::by_message(&state.pool, chat_id, mid).await {
+            return Some(item);
+        }
+    }
+    if crate::intake::is_deictic_query(query_text) {
+        if let Ok(Some(item)) =
+            db::items::latest_in_chat(&state.pool, chat_id, user_id, 15).await
+        {
+            return Some(item);
+        }
+    }
+    None
+}
+
+fn anchor_aware_query(question: &str, item: &RetrievedItem) -> String {
+    let label = item
+        .title
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .unwrap_or(&item.url);
+    format!("{question} — specifically about: {label} ({})", item.url)
+}
+
+/// Retrieve passages for a single anchored item only.
+async fn anchor_sources(
+    state: &AppState,
+    scope: QueryScope,
+    user_id: i64,
+    item: &RetrievedItem,
+    embeds: &[Vec<f32>],
+) -> Vec<Source> {
+    let item_ids = [item.id];
+    let mut lists = Vec::new();
+    match scope {
+        QueryScope::Personal => {
+            for e in embeds {
+                if let Ok(h) = db::chunks::search_within_items_by_owner(
+                    &state.pool,
+                    user_id,
+                    e,
+                    &item_ids,
+                    CHUNK_K,
+                )
+                .await
+                {
+                    lists.push(h);
+                }
+            }
+        }
+        QueryScope::Group(group_id) => {
+            for e in embeds {
+                if let Ok(h) = db::chunks::search_within_items(
+                    &state.pool,
+                    group_id,
+                    e,
+                    &item_ids,
+                    CHUNK_K,
+                )
+                .await
+                {
+                    lists.push(h);
+                }
+            }
+        }
+    }
+    let hits = rrf_fuse(lists, CHUNK_K as usize);
+    if !hits.is_empty() {
+        return group_hits(hits);
+    }
+    // Item ingested but no chunks yet — fall back to summary / raw text.
+    let passage = item
+        .summary
+        .clone()
+        .or_else(|| item.raw_content.clone())
+        .unwrap_or_else(|| item.url.clone());
+    vec![Source {
+        item: item.clone(),
+        passages: vec![passage],
+    }]
 }
 
 /// Hybrid retrieval over multiple query embeddings: vector search per embedding
@@ -319,13 +775,26 @@ async fn hybrid_retrieve(
 
 /// Outcome of resolving a Tier 5 response.
 enum AnswerOutcome {
-    Answered { answer: String, cited: Vec<usize> },
-    NeedMore { follow_up: Vec<String> },
+    Answered {
+        answer: String,
+        cited: Vec<usize>,
+        needs_external: bool,
+        external_queries: Vec<String>,
+    },
+    NeedMore {
+        follow_up: Vec<String>,
+        needs_external: bool,
+        external_queries: Vec<String>,
+    },
 }
 
-/// Resolve a Tier 5 response into an outcome. Robust to schema drift: accepts our
-/// strict `{answerable, answer, sources, follow_up}` shape, alternative answer keys
-/// (`text`/`response`/`summary`), and plain prose — and NEVER surfaces raw JSON.
+struct DualOutcome {
+    answer: String,
+    cited: Vec<usize>,
+    web_cited: Vec<usize>,
+}
+
+/// Resolve a Tier 5 response into an outcome.
 fn resolve_outcome(raw: &str, n: usize) -> AnswerOutcome {
     let cleaned = strip_fences(raw);
 
@@ -339,10 +808,19 @@ fn resolve_outcome(raw: &str, n: usize) -> AnswerOutcome {
 
     if let Some(v) = &json {
         let follow_up = string_array(v, "follow_up");
+        let external_queries = string_array(v, "external_queries");
+        let needs_external = v
+            .get("needs_external")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         // Explicit "not answerable" → ask for more, with the model's leads.
         if v.get("answerable").and_then(serde_json::Value::as_bool) == Some(false) {
-            return AnswerOutcome::NeedMore { follow_up };
+            return AnswerOutcome::NeedMore {
+                follow_up,
+                needs_external,
+                external_queries,
+            };
         }
         let answer = ["answer", "text", "response", "summary"]
             .iter()
@@ -370,10 +848,16 @@ fn resolve_outcome(raw: &str, n: usize) -> AnswerOutcome {
             return AnswerOutcome::Answered {
                 answer: answer.to_string(),
                 cited,
+                needs_external,
+                external_queries,
             };
         }
         // JSON but no answer field — don't leak braces; treat as "need more".
-        return AnswerOutcome::NeedMore { follow_up };
+        return AnswerOutcome::NeedMore {
+            follow_up,
+            needs_external,
+            external_queries,
+        };
     }
 
     // Not JSON → plain prose answer, infer citations from the text.
@@ -381,11 +865,15 @@ fn resolve_outcome(raw: &str, n: usize) -> AnswerOutcome {
     if prose.is_empty() || prose.starts_with('{') {
         return AnswerOutcome::NeedMore {
             follow_up: Vec::new(),
+            needs_external: false,
+            external_queries: Vec::new(),
         };
     }
     AnswerOutcome::Answered {
         answer: prose.to_string(),
         cited: cited_in_text(prose, n),
+        needs_external: false,
+        external_queries: Vec::new(),
     }
 }
 
@@ -610,7 +1098,7 @@ mod tests {
 
     fn answered(raw: &str, n: usize) -> (String, Vec<usize>) {
         match resolve_outcome(raw, n) {
-            AnswerOutcome::Answered { answer, cited } => (answer, cited),
+            AnswerOutcome::Answered { answer, cited, .. } => (answer, cited),
             AnswerOutcome::NeedMore { .. } => panic!("expected Answered, got NeedMore"),
         }
     }
@@ -637,9 +1125,34 @@ mod tests {
             r#"{"answerable":false,"answer":"","sources":[],"follow_up":["q1","q2"]}"#,
             3,
         ) {
-            AnswerOutcome::NeedMore { follow_up } => assert_eq!(follow_up, vec!["q1", "q2"]),
+            AnswerOutcome::NeedMore { follow_up, .. } => assert_eq!(follow_up, vec!["q1", "q2"]),
             AnswerOutcome::Answered { .. } => panic!("expected NeedMore"),
         }
+    }
+
+    #[test]
+    fn needs_external_flag_parsed() {
+        match resolve_outcome(
+            r#"{"answerable":true,"answer":"x","sources":[1],"needs_external":true,"external_queries":["q"]}"#,
+            3,
+        ) {
+            AnswerOutcome::Answered {
+                needs_external,
+                external_queries,
+                ..
+            } => {
+                assert!(needs_external);
+                assert_eq!(external_queries, vec!["q"]);
+            }
+            AnswerOutcome::NeedMore { .. } => panic!("expected Answered"),
+        }
+    }
+
+    #[test]
+    fn web_citations_inferred() {
+        let out = resolve_dual_outcome("Answer from [W1] and [1].", 2, 2);
+        assert_eq!(out.web_cited, vec![1]);
+        assert_eq!(out.cited, vec![1]);
     }
 
     #[test]

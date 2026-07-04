@@ -172,6 +172,20 @@ impl Chat {
         parse_json(&raw).context("parsing query expansion")
     }
 
+    // ── Intent router for /ask --web ────────────────────────────────────────
+    pub async fn classify_query_intent(&self, question: &str) -> Result<QueryIntent> {
+        let user = format!(
+            "Classify this question for a personal knowledge assistant that has \
+             (a) the user's saved links/notes and (b) optional live web search.\n\
+             Question: {question}\n\n\
+             Return JSON only: \
+             {{\"intent\": \"recall|synthesize|augment|open|hybrid\", \
+             \"web_queries\": [\"0-2 focused web search queries; empty for recall/synthesize\"]}}"
+        );
+        let raw = self.complete(Tier::Two, None, &user, 256).await?;
+        parse_json(&raw).context("parsing query intent")
+    }
+
     // ── Tier 4: entity + edge extraction ────────────────────────────────────
     pub async fn extract_graph(&self, batch_prompt: &str) -> Result<String> {
         self.complete(Tier::Four, None, batch_prompt, 4096).await
@@ -198,6 +212,26 @@ pub struct QueryExpansion {
     pub probes: Vec<String>,
     #[serde(default)]
     pub hyde: String,
+}
+
+/// How much external web context a question likely needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryIntentKind {
+    #[default]
+    Recall,
+    Synthesize,
+    Augment,
+    Open,
+    Hybrid,
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct QueryIntent {
+    #[serde(default)]
+    pub intent: QueryIntentKind,
+    #[serde(default)]
+    pub web_queries: Vec<String>,
 }
 
 /// Tolerantly pull a JSON object out of an LLM response (handles ```json fences).

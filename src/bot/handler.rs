@@ -113,7 +113,16 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
 
     // 2. Slash commands (text only).
     if let Some(uid) = user_id {
-        if commands::try_handle(state, chat_id, uid, msg.id.0, text, in_private).await? {
+        if commands::try_handle(
+            state,
+            chat_id,
+            uid,
+            msg.id.0,
+            msg.reply_to_message().map(|m| m.id.0 as i64),
+            text,
+            in_private,
+        )
+        .await? {
             return Ok(());
         }
     }
@@ -157,16 +166,28 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let (scope, question) = commands::parse_ask_args(chat_id, body);
+    let req = commands::parse_ask_args(chat_id, body);
     let wants_query =
-        matches!(scope, query::QueryScope::Group(_)) || intake::is_question(&question);
+        matches!(req.scope, query::QueryScope::Group(_)) || intake::is_question(&req.question);
 
     if wants_query {
-        if question.is_empty() {
+        if req.question.is_empty() {
             return Ok(());
         }
         tracing::info!(chat_id, user = uid, "telegram query");
-        let reply = commands::run_query(state, chat_id, uid, scope, &question).await?;
+        let anchor = query::QueryAnchor {
+            reply_message_id: msg.reply_to_message().map(|m| m.id.0 as i64),
+        };
+        let reply = commands::run_query(
+            state,
+            chat_id,
+            uid,
+            req.scope,
+            req.web,
+            anchor,
+            &req.question,
+        )
+        .await?;
         commands::send_query_reply(state, chat_id, msg.id.0, &reply).await;
     } else {
         tracing::info!(chat_id, user = uid, "telegram note queued");

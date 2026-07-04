@@ -199,6 +199,41 @@ pub async fn search_within_items(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// Best passages for specific items in a user's personal corpus.
+pub async fn search_within_items_by_owner(
+    pool: &PgPool,
+    owner_user_id: i64,
+    query: &[f32],
+    item_ids: &[Uuid],
+    limit: i64,
+) -> Result<Vec<ChunkHit>> {
+    if item_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let qvec = Vector::from(query.to_vec());
+    let rows: Vec<ChunkRow> = sqlx::query_as(
+        r#"
+        SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
+               i.message_id, i.shared_at, c.content,
+               i.source_channel, i.content_type, i.group_id,
+               1 - (c.embedding <=> $2) AS similarity
+        FROM chunks c
+        JOIN items i ON i.id = c.item_id
+        LEFT JOIN users u ON u.id = i.shared_by
+        WHERE c.owner_user_id = $1 AND c.embedding IS NOT NULL AND c.item_id = ANY($3)
+        ORDER BY c.embedding <=> $2 ASC
+        LIMIT $4
+        "#,
+    )
+    .bind(owner_user_id)
+    .bind(qvec)
+    .bind(item_ids)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 /// Keyword (full-text) search over passages — the lexical half of hybrid search.
 ///
 /// Uses OR semantics: `plainto_tsquery` ANDs terms, which is wrong for natural
