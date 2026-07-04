@@ -1,15 +1,11 @@
-//! The relevance interrupt — the core proactive feature.
-//!
-//! Runs immediately after every item is ingested: scores the item against every
-//! other active user's interest vector and DMs a personal notification when the
-//! score clears that user's threshold.
+//! The relevance interrupt — taste-aware proactive notifications.
 
 use crate::bot::formatter;
-use crate::db;
-use crate::scorer::vectors::cosine_similarity;
+use crate::db::{self, events::event_type};
+use crate::scorer::ranker;
 use crate::state::AppState;
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 use uuid::Uuid;
@@ -23,11 +19,10 @@ pub struct ScoredItem<'a> {
     pub url: &'a str,
     pub message_id: i64,
     pub raw_content: Option<&'a str>,
+    pub tags: &'a [String],
+    pub shared_at: DateTime<Utc>,
 }
 
-/// Score one freshly-ingested item against the group and fire notifications.
-/// Never returns an error to the caller path that would abort ingestion — all
-/// per-user failures are logged and swallowed.
 pub async fn run(state: &AppState, item: ScoredItem<'_>) {
     if let Err(e) = run_inner(state, &item).await {
         tracing::warn!(item_id = %item.item_id, error = %e, "relevance scorer failed");
@@ -36,7 +31,7 @@ pub async fn run(state: &AppState, item: ScoredItem<'_>) {
 
 async fn run_inner(state: &AppState, item: &ScoredItem<'_>) -> Result<()> {
     let profiles =
-        db::profiles::list_active_in_group(&state.pool, item.group_id, item.sharer_id).await?;
+        db::taste::list_active_in_group(&state.pool, item.group_id, item.sharer_id).await?;
     if profiles.is_empty() {
         return Ok(());
     }
@@ -44,15 +39,14 @@ async fn run_inner(state: &AppState, item: &ScoredItem<'_>) -> Result<()> {
     let now = Utc::now();
 
     for profile in profiles {
-        let Some(vec) = &profile.interest_vector else {
-            continue;
-        };
-        let score = cosine_similarity(item.embedding, vec);
+        let score = ranker::relevance_score(
+            item.embedding,
+            item.tags,
+            item.shared_at,
+            &profile,
+        );
 
-        let above = score >= profile.relevance_threshold;
-
-        // Calibration logging for below-threshold scores.
-        if !above {
+        if score < profile.notify_threshold {
             if state.config.notification_score_log {
                 let _ =
                     db::notifications::log(&state.pool, profile.user_id, item.item_id, score, false)
@@ -61,21 +55,18 @@ async fn run_inner(state: &AppState, item: &ScoredItem<'_>) -> Result<()> {
             continue;
         }
 
-        // Respect mute.
         if profile.muted_until.map(|m| m > now).unwrap_or(false) {
             continue;
         }
 
-        // Dedup.
         if db::notifications::already_notified(&state.pool, profile.user_id, item.item_id).await? {
             continue;
         }
 
-        // Tier 2 excerpt tuned to this user's interests.
         let content = item.raw_content.unwrap_or(item.title);
         let excerpt = match state
             .chat
-            .extract_excerpt(content, &profile.top_tags)
+            .extract_excerpt(content, &profile.liked_tags)
             .await
         {
             Ok(e) if !e.trim().is_empty() => e,
@@ -89,7 +80,7 @@ async fn run_inner(state: &AppState, item: &ScoredItem<'_>) -> Result<()> {
             .unwrap_or_else(|| "Someone".to_string());
 
         let link = formatter::message_link(item.group_id, item.message_id);
-        let matching_tag = best_matching_tag(&profile.top_tags);
+        let matching_tag = profile.liked_tags.first().map(|s| s.as_str());
 
         let text = formatter::notification(
             &sharer_name,
@@ -100,42 +91,48 @@ async fn run_inner(state: &AppState, item: &ScoredItem<'_>) -> Result<()> {
             matching_tag,
             link.as_deref(),
         );
+        let keyboard = formatter::notification_keyboard(item.item_id);
 
-        // DM the user directly — never the group.
         match state
             .bot
             .send_message(ChatId(profile.user_id), text)
             .parse_mode(ParseMode::Html)
             .link_preview_options(formatter::no_preview())
+            .reply_markup(keyboard)
             .await
         {
             Ok(_) => {
                 db::notifications::log(&state.pool, profile.user_id, item.item_id, score, true)
                     .await?;
-                // Receiving relevant content is a weak interest signal (0.5).
-                let _ = db::profiles::apply_weighted_update(
+                let _ = db::events::log(
                     &state.pool,
                     profile.user_id,
-                    item.group_id,
+                    event_type::NOTIFY_SENT,
+                    Some(item.item_id),
+                    0.5,
+                    serde_json::json!({ "score": score }),
+                )
+                .await;
+                let _ = db::taste::apply_signal(
+                    &state.pool,
+                    profile.user_id,
                     item.embedding,
                     0.5,
                     state.config.max_vector_weight,
                     state.config.default_relevance_threshold,
+                    state.config.taste_decay_lambda,
                     &[],
+                    false,
+                    false,
                     false,
                 )
                 .await;
             }
             Err(e) => {
-                // Most common cause: the user has never opened a DM with the bot.
                 tracing::info!(user = profile.user_id, error = %e, "notification DM failed");
             }
         }
     }
 
     Ok(())
-}
-
-fn best_matching_tag(top_tags: &[String]) -> Option<&str> {
-    top_tags.first().map(|s| s.as_str())
 }

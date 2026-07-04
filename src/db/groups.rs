@@ -4,11 +4,13 @@ use crate::models::ContextMessage;
 use anyhow::Result;
 use sqlx::PgPool;
 
-/// Upsert a group, refreshing its name if we now know it.
+/// Upsert a Telegram group, refreshing its name if we now know it.
+/// (Non-Telegram spaces go through `db::channels::resolve_space`.)
 pub async fn upsert_group(pool: &PgPool, id: i64, name: Option<&str>) -> Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO groups (id, name) VALUES ($1, $2)
+        INSERT INTO groups (id, name, channel, external_id)
+        VALUES ($1, $2, 'telegram', $1::text)
         ON CONFLICT (id) DO UPDATE
         SET name = COALESCE(EXCLUDED.name, groups.name)
         "#,
@@ -20,7 +22,8 @@ pub async fn upsert_group(pool: &PgPool, id: i64, name: Option<&str>) -> Result<
     Ok(())
 }
 
-/// Upsert a user, refreshing username / first_name.
+/// Upsert a Telegram user, refreshing username / first_name.
+/// (Non-Telegram users go through `db::channels::resolve_user`.)
 pub async fn upsert_user(
     pool: &PgPool,
     id: i64,
@@ -29,7 +32,8 @@ pub async fn upsert_user(
 ) -> Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO users (id, username, first_name) VALUES ($1, $2, $3)
+        INSERT INTO users (id, username, first_name, channel, external_id)
+        VALUES ($1, $2, $3, 'telegram', $1::text)
         ON CONFLICT (id) DO UPDATE
         SET username   = COALESCE(EXCLUDED.username, users.username),
             first_name = COALESCE(EXCLUDED.first_name, users.first_name)

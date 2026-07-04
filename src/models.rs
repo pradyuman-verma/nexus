@@ -57,6 +57,21 @@ pub struct IngestionJob {
     pub shared_by: i64,
     pub message_id: i64,
     pub context_window: ContextWindow,
+    /// Ingress channel: telegram | whatsapp | x | manual.
+    pub source_channel: String,
+    /// Pre-extracted content (notes, voice transcripts, image descriptions).
+    /// When set, Tier 1 fetch is skipped and `url` is a pseudo-URL
+    /// (`note://…`, `voice://…`, `image://…`).
+    pub note: Option<NoteContent>,
+}
+
+/// Channel-captured content that never had a URL to fetch.
+#[derive(Debug, Clone)]
+pub struct NoteContent {
+    /// items.content_type value: 'note' | 'voice' | 'image'.
+    pub content_type: String,
+    pub title: Option<String>,
+    pub text: String,
 }
 
 /// Result of fetching + extracting a URL (Tier 1).
@@ -79,7 +94,7 @@ pub struct Summary {
     pub category: Option<String>,
 }
 
-/// A user's per-group interest profile.
+/// A user's per-group interest profile (legacy — group-scoped notifications).
 #[allow(dead_code)] // group_id kept for symmetry / future per-profile routing
 #[derive(Debug, Clone)]
 pub struct UserProfile {
@@ -90,6 +105,39 @@ pub struct UserProfile {
     pub relevance_threshold: f32,
     pub top_tags: Vec<String>,
     pub muted_until: Option<DateTime<Utc>>,
+}
+
+/// Global taste profile — one brain per user across all channels (Layer 2).
+#[derive(Debug, Clone)]
+pub struct UserTasteProfile {
+    pub user_id: i64,
+    pub interest_vector: Option<Vec<f32>>,
+    pub vector_weight: f32,
+    pub notify_threshold: f32,
+    pub liked_tags: Vec<String>,
+    pub disliked_tags: Vec<String>,
+    pub capture_count: i32,
+    pub query_count: i32,
+    pub muted_until: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Tier 2c structured signals extracted from a capture's context envelope.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextSignals {
+    #[serde(default)]
+    pub intent: Option<String>,
+    /// -1.0 (negative) to +1.0 (strong positive).
+    #[serde(default)]
+    pub sentiment: f32,
+    #[serde(default)]
+    pub entities: Vec<String>,
+    #[serde(default = "default_signal_strength")]
+    pub signal_strength: f32,
+}
+
+fn default_signal_strength() -> f32 {
+    1.0
 }
 
 /// A stored knowledge-graph item, as retrieved for query synthesis.
@@ -109,4 +157,8 @@ pub struct RetrievedItem {
     pub message_id: Option<i64>,
     pub shared_at: DateTime<Utc>,
     pub similarity: f32,
+    /// Ingress channel: telegram | whatsapp | …
+    pub source_channel: Option<String>,
+    /// note | voice | image | article | …
+    pub content_type: Option<String>,
 }

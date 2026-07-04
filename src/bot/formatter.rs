@@ -1,7 +1,9 @@
 //! Telegram message formatting (HTML parse mode) and deep-link construction.
 
 use crate::models::RetrievedItem;
-use teloxide::types::LinkPreviewOptions;
+use chrono::{DateTime, Utc};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions};
+use uuid::Uuid;
 
 /// Link-preview options that fully disable the preview bubble.
 pub fn no_preview() -> LinkPreviewOptions {
@@ -42,6 +44,30 @@ pub fn domain_of(url: &str) -> Option<String> {
     url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_string()))
+}
+
+/// Human channel name for provenance, e.g. "Telegram" / "WhatsApp".
+pub fn channel_label(source_channel: Option<&str>) -> &'static str {
+    match source_channel {
+        Some("telegram") => "Telegram",
+        Some("whatsapp") => "WhatsApp",
+        Some(_) => "Other",
+        None => "Unknown",
+    }
+}
+
+/// Short date for source lines, e.g. "Jun 4".
+pub fn short_date(dt: DateTime<Utc>) -> String {
+    dt.format("%b %-d").to_string()
+}
+
+/// Provenance suffix: "Telegram · Jun 4".
+pub fn source_provenance(item: &RetrievedItem) -> String {
+    format!(
+        "{} · {}",
+        channel_label(item.source_channel.as_deref()),
+        short_date(item.shared_at)
+    )
 }
 
 /// The personal relevance-interrupt notification (HTML).
@@ -90,20 +116,74 @@ pub fn query_answer(
     for &n in cited {
         let Some(item) = items.get(n - 1) else { continue };
         let label = esc(&item_label(item));
-        let who = item
-            .shared_by_username
-            .as_deref()
-            .map(|u| format!("@{u}"))
-            .unwrap_or_else(|| "someone".to_string());
-        let date = item.shared_at.format("%Y-%m-%d");
+        let provenance = esc(&source_provenance(item));
         let link = item
             .message_id
             .and_then(|m| message_link(chat_id, m))
             .unwrap_or_else(|| item.url.clone());
         out.push_str(&format!(
-            "\n{n}. <a href=\"{}\">{label}</a> — shared by {who} on {date}",
+            "\n[{n}] <a href=\"{}\">{label}</a> ({provenance})",
             esc(&link)
         ));
     }
     out
+}
+
+/// 👍/👎 feedback row for /ask replies. 👎 encodes the primary cited item id.
+pub fn ask_feedback_keyboard(primary_item_id: Option<Uuid>) -> InlineKeyboardMarkup {
+    let mut row = vec![InlineKeyboardButton::callback("👍", "au")];
+    if let Some(id) = primary_item_id {
+        row.push(InlineKeyboardButton::callback("👎", format!("ad:{id}")));
+    }
+    InlineKeyboardMarkup::new(vec![row])
+}
+
+/// "Not relevant" dismiss button for relevance DMs.
+pub fn notification_keyboard(item_id: Uuid) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "Not relevant",
+        format!("nd:{item_id}"),
+    )]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn sample_item(channel: &str, title: &str) -> RetrievedItem {
+        RetrievedItem {
+            id: Uuid::new_v4(),
+            url: "https://example.com".into(),
+            title: Some(title.into()),
+            summary: None,
+            raw_content: None,
+            tags: vec![],
+            category: None,
+            context_window: None,
+            shared_by: None,
+            shared_by_username: None,
+            message_id: None,
+            shared_at: Utc::now(),
+            similarity: 0.0,
+            source_channel: Some(channel.into()),
+            content_type: Some("article".into()),
+        }
+    }
+
+    #[test]
+    fn source_provenance_formats_channel_and_date() {
+        let item = sample_item("whatsapp", "Voice note");
+        let p = source_provenance(&item);
+        assert!(p.starts_with("WhatsApp · "));
+    }
+
+    #[test]
+    fn query_answer_shows_provenance() {
+        let items = vec![sample_item("telegram", "Robotics fund")];
+        let out = query_answer("Answer [1].", &items, &[1], -100123);
+        assert!(out.contains("Robotics fund"));
+        assert!(out.contains("Telegram ·"));
+        assert!(out.contains("[1]"));
+    }
 }

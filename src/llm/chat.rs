@@ -93,6 +93,43 @@ impl Chat {
         }
     }
 
+    // ── Vision: describe a captured photo (WhatsApp/IG ingress) ─────────────
+    /// Requires Claude — the local Ollama route has no vision model wired up.
+    pub async fn describe_image(&self, image: &[u8], media_type: &str) -> Result<String> {
+        let a = self.anthropic.as_ref().ok_or_else(|| {
+            anyhow!("image capture requires ANTHROPIC_API_KEY (vision)")
+        })?;
+        a.describe_image(
+            image,
+            media_type,
+            "Describe this image in 2-3 sentences for a personal knowledge archive: \
+             what it shows, any readable text, and why someone might have saved it.",
+        )
+        .await
+    }
+
+    // ── Tier 2c: context envelope → structured user signals ───────────────
+    pub async fn parse_context_signals(
+        &self,
+        title: &str,
+        context_text: &str,
+        user_comment: &str,
+    ) -> Result<crate::models::ContextSignals> {
+        let user = format!(
+            "Content title: {title}\n\
+             Conversation around the share:\n{context_text}\n\
+             User's own message/comment: {user_comment}\n\n\
+             Extract why the user saved this and how they feel about the topic. \
+             Return JSON only: \
+             {{\"intent\": \"brief why they saved it\", \
+             \"sentiment\": -1.0 to 1.0, \
+             \"entities\": [\"topics/people/companies they care about here\"], \
+             \"signal_strength\": 0.5 to 2.0}}"
+        );
+        let raw = self.complete(Tier::Two, None, &user, 512).await?;
+        parse_json(&raw).context("parsing context signals JSON")
+    }
+
     // ── Tier 2: summarize + tag + classify ──────────────────────────────────
     pub async fn summarize(&self, title: &str, content: &str) -> Result<Summary> {
         let user = format!(

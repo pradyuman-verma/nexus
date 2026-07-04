@@ -10,8 +10,7 @@ use anyhow::{anyhow, Result};
 use scraper::{Html, Selector};
 use std::time::Duration;
 
-const USER_AGENT: &str =
-    "Mozilla/5.0 (compatible; NexusBot/0.1; +https://github.com/nexus-bot)";
+const USER_AGENT: &str = "Mozilla/5.0 (compatible; NexusBot/0.1; +https://github.com/nexus-bot)";
 const MIN_BODY_CHARS: usize = 200;
 
 /// Fetch + extract. On HTTP/transport failure returns an `Err`; on a soft failure
@@ -42,8 +41,7 @@ pub fn extract(html: &str) -> ExtractedContent {
         .or_else(|| meta_name(&doc, "twitter:title"))
         .or_else(|| text_of(&doc, "title"));
     let author = meta_name(&doc, "author").or_else(|| meta(&doc, "article:author"));
-    let published = meta(&doc, "article:published_time")
-        .or_else(|| meta_name(&doc, "date"));
+    let published = meta(&doc, "article:published_time").or_else(|| meta_name(&doc, "date"));
     let description = meta(&doc, "og:description").or_else(|| meta_name(&doc, "description"));
 
     let body = extract_body(&doc);

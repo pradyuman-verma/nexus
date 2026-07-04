@@ -1,17 +1,22 @@
 //! The single message endpoint: buffering, URL/forward detection, command and
-//! @mention routing.
+//! capture routing (links, notes, voice, photos) and @mention queries.
+//!
+//! ## Group vs DM behaviour
+//! - **DMs**: passive capture — links, text notes, voice, and photos are saved
+//!   without @mentioning. Questions (heuristic) route to `/ask`.
+//! - **Groups**: links in any message are captured passively (existing behaviour).
+//!   Text notes, voice, and photos require an @mention of the bot so we don't
+//!   ingest ambient group chatter. @mention + question → query; @mention + note → capture.
 
 use crate::bot::commands;
 use crate::db;
-use crate::models::{ContextMessage, ContextPosition, ContextWindow, IngestionJob};
-use crate::query;
+use crate::intake;
 use crate::state::AppState;
-use std::time::Duration;
+use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::ParseMode;
+use teloxide::types::ReactionType;
 
-const CONTEXT_BEFORE: i64 = 3;
-const CONTEXT_AFTER: i64 = 3;
+const CHANNEL: &str = "telegram";
 
 /// teloxide endpoint. Always returns Ok — internal failures are logged, never
 /// propagated (an error here would drop the update and spam logs).
@@ -40,12 +45,59 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
         "rx message"
     );
 
+    let in_private = msg.chat.is_private();
+    let mentioned_text = mention_query(state, text);
+    let capture_eligible = in_private || mentioned_text.is_some();
+
     // 1. Persist group/user, buffer the message.
     db::groups::upsert_group(&state.pool, chat_id, msg.chat.title()).await?;
     if let Some(uid) = user_id {
         db::groups::upsert_user(&state.pool, uid, username.as_deref(), first_name.as_deref())
             .await?;
     }
+
+    let forwarded = is_forwarded(msg);
+    let forward_origin = forward_origin(msg);
+
+    // Voice note — DMs or @mention in groups.
+    if msg.voice().is_some() {
+        if !capture_eligible {
+            return Ok(());
+        }
+        let Some(uid) = user_id else {
+            return Ok(());
+        };
+        return handle_voice(state, msg, chat_id, uid, message_id, forwarded).await;
+    }
+
+    // Photo — DMs or @mention in groups.
+    if msg.photo().is_some() {
+        let Some(uid) = user_id else {
+            return Ok(());
+        };
+        // URLs in a photo caption are captured passively even without @mention.
+        if !text.is_empty() {
+            let queued = schedule_urls(
+                state,
+                msg,
+                chat_id,
+                uid,
+                message_id,
+                text,
+                forwarded,
+                forward_origin.clone(),
+            )
+            .await?;
+            if queued {
+                capture_ack(state, msg, "✓ saved — reading it in the background").await;
+            }
+        }
+        if !capture_eligible {
+            return Ok(());
+        }
+        return handle_photo(state, msg, chat_id, uid, message_id, forwarded).await;
+    }
+
     db::groups::buffer_message(
         &state.pool,
         chat_id,
@@ -56,39 +108,199 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
     )
     .await?;
 
-    // 4. Command or @mention → query path (handled before URL ingestion so a
-    //    "/ask https://..." isn't also ingested as a shared link).
+    // 2. Slash commands (text only).
     if let Some(uid) = user_id {
-        if commands::try_handle(state, chat_id, uid, msg.id.0, text).await? {
-            return Ok(());
-        }
-        if let Some(query) = mention_query(state, text) {
-            tracing::info!(chat_id, user = uid, "rx @mention query");
-            let reply = query::handler::handle(state, chat_id, uid, &query).await?;
-            state
-                .bot
-                .send_message(msg.chat.id, reply)
-                .parse_mode(ParseMode::Html)
-                .link_preview_options(crate::bot::formatter::no_preview())
-                .reply_parameters(teloxide::types::ReplyParameters::new(msg.id))
-                .await
-                .ok();
+        if commands::try_handle(state, chat_id, uid, msg.id.0, text, in_private).await? {
             return Ok(());
         }
     }
 
-    // 2/3. URL detection (incl. forwarded content).
-    let urls = extract_urls(text);
-    if urls.is_empty() {
+    // 3. Shared links — passive in groups and DMs.
+    let urls = intake::extract_urls(text);
+    if !urls.is_empty() {
+        let Some(uid) = user_id else {
+            return Ok(());
+        };
+        let queued = schedule_urls(
+            state,
+            msg,
+            chat_id,
+            uid,
+            message_id,
+            text,
+            forwarded,
+            forward_origin,
+        )
+        .await?;
+        if queued {
+            capture_ack(state, msg, "✓ saved — reading it in the background").await;
+        }
         return Ok(());
     }
-    let Some(uid) = user_id else { return Ok(()) };
 
-    let forwarded = is_forwarded(msg);
-    let forward_origin = forward_origin(msg);
+    // 4. Text notes and @mention queries — DMs or @mention in groups only.
+    if !capture_eligible || text.trim().is_empty() {
+        return Ok(());
+    }
+    let Some(uid) = user_id else {
+        return Ok(());
+    };
 
+    let body = mentioned_text.as_deref().unwrap_or(text).trim();
+    if body.is_empty() {
+        return Ok(());
+    }
+
+    if intake::is_question(body) {
+        tracing::info!(chat_id, user = uid, "telegram query");
+        let reply = commands::run_query(state, chat_id, uid, body).await?;
+        commands::send_query_reply(state, chat_id, msg.id.0, &reply).await;
+    } else {
+        tracing::info!(chat_id, user = uid, "telegram note queued");
+        intake::schedule_note(
+            state,
+            chat_id,
+            msg.chat.title().map(|s| s.to_string()),
+            uid,
+            message_id,
+            forwarded,
+            "note",
+            body.to_string(),
+            CHANNEL,
+        )
+        .await?;
+        capture_ack(state, msg, "✓ noted").await;
+    }
+
+    Ok(())
+}
+
+async fn handle_voice(
+    state: &AppState,
+    msg: &Message,
+    chat_id: i64,
+    uid: i64,
+    message_id: i64,
+    forwarded: bool,
+) -> anyhow::Result<()> {
+    let voice = msg.voice().expect("voice branch");
+    let username = msg.from.as_ref().and_then(|u| u.username.as_deref());
+
+    let Some(stt) = state.stt.clone() else {
+        state
+            .bot
+            .send_message(
+                msg.chat.id,
+                "Voice notes aren't enabled yet (no speech-to-text configured).",
+            )
+            .reply_parameters(teloxide::types::ReplyParameters::new(msg.id))
+            .await
+            .ok();
+        return Ok(());
+    };
+
+    let (bytes, mime) = download_voice(state, voice).await?;
+    let transcript = stt.transcribe(bytes, &mime).await?;
+    if transcript.is_empty() {
+        state
+            .bot
+            .send_message(msg.chat.id, "Couldn't hear anything in that voice note.")
+            .reply_parameters(teloxide::types::ReplyParameters::new(msg.id))
+            .await
+            .ok();
+        return Ok(());
+    }
+
+    db::groups::buffer_message(
+        &state.pool,
+        chat_id,
+        Some(uid),
+        username,
+        message_id,
+        Some(&transcript),
+    )
+    .await?;
+
+    tracing::info!(chat_id, user = uid, "telegram voice queued");
+    intake::schedule_note(
+        state,
+        chat_id,
+        msg.chat.title().map(|s| s.to_string()),
+        uid,
+        message_id,
+        forwarded,
+        "voice",
+        transcript,
+        CHANNEL,
+    )
+    .await?;
+    capture_ack(state, msg, "✓ voice note transcribed & saved").await;
+    Ok(())
+}
+
+async fn handle_photo(
+    state: &AppState,
+    msg: &Message,
+    chat_id: i64,
+    uid: i64,
+    message_id: i64,
+    forwarded: bool,
+) -> anyhow::Result<()> {
+    let photos = msg.photo().expect("photo branch");
+    let username = msg.from.as_ref().and_then(|u| u.username.as_deref());
+    let largest = photos.last().expect("photo message has sizes");
+
+    let bytes = download_file(state, &largest.file.id).await?;
+    let description = state.chat.describe_image(&bytes, "image/jpeg").await?;
+    let caption = msg.caption().unwrap_or("").trim();
+    let text = if caption.is_empty() {
+        description
+    } else {
+        format!("{caption}\n\n{description}")
+    };
+
+    db::groups::buffer_message(
+        &state.pool,
+        chat_id,
+        Some(uid),
+        username,
+        message_id,
+        Some(&text),
+    )
+    .await?;
+
+    tracing::info!(chat_id, user = uid, "telegram photo queued");
+    intake::schedule_note(
+        state,
+        chat_id,
+        msg.chat.title().map(|s| s.to_string()),
+        uid,
+        message_id,
+        forwarded,
+        "image",
+        text,
+        CHANNEL,
+    )
+    .await?;
+    capture_ack(state, msg, "✓ photo saved").await;
+    Ok(())
+}
+
+/// Enqueue every non-duplicate, non-t.me URL in `text`. Returns true if at
+/// least one link was queued.
+async fn schedule_urls(
+    state: &AppState,
+    msg: &Message,
+    chat_id: i64,
+    uid: i64,
+    message_id: i64,
+    text: &str,
+    forwarded: bool,
+    forward_origin: Option<String>,
+) -> anyhow::Result<bool> {
+    let urls = intake::extract_urls(text);
+    let mut queued = false;
     for url in urls {
-        // Tier 1 dedup: skip t.me links and recently-seen URLs.
         if is_telegram_link(&url) {
             continue;
         }
@@ -99,9 +311,8 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
             tracing::info!(%url, chat_id, "link shared (duplicate — skipped)");
             continue;
         }
-
         tracing::info!(%url, chat_id, user = uid, "link shared — queued for ingestion");
-        schedule_ingestion(
+        intake::schedule_link(
             state.clone(),
             url,
             chat_id,
@@ -110,105 +321,56 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
             message_id,
             forwarded,
             forward_origin.clone(),
+            CHANNEL,
         );
+        queued = true;
     }
-
-    Ok(())
+    Ok(queued)
 }
 
-/// Build the context window (waiting for trailing messages) then enqueue.
-#[allow(clippy::too_many_arguments)]
-fn schedule_ingestion(
-    state: AppState,
-    url: String,
-    group_id: i64,
-    group_name: Option<String>,
-    shared_by: i64,
-    message_id: i64,
-    forwarded: bool,
-    forward_origin: Option<String>,
-) {
-    tokio::spawn(async move {
-        let wait = state.config.context_window_wait_secs;
-        tokio::time::sleep(Duration::from_secs(wait)).await;
-
-        let context_window =
-            build_context_window(&state, group_id, message_id, forwarded, forward_origin).await;
-
-        let job = IngestionJob {
-            url,
-            group_id,
-            group_name,
-            shared_by,
-            message_id,
-            context_window,
-        };
-        if let Err(e) = state.ingestion_tx.send(job).await {
-            tracing::error!(error = %e, "failed to enqueue ingestion job");
-        }
-    });
+async fn download_file(state: &AppState, file_id: &str) -> anyhow::Result<Vec<u8>> {
+    let file = state.bot.get_file(file_id).await?;
+    let mut buf = Vec::new();
+    state.bot.download_file(&file.path, &mut buf).await?;
+    Ok(buf)
 }
 
-async fn build_context_window(
-    state: &AppState,
-    group_id: i64,
-    message_id: i64,
-    forwarded: bool,
-    forward_origin: Option<String>,
-) -> ContextWindow {
-    let mut messages: Vec<ContextMessage> =
-        db::groups::messages_before(&state.pool, group_id, message_id, CONTEXT_BEFORE)
-            .await
-            .unwrap_or_default();
+async fn download_voice(state: &AppState, voice: &teloxide::types::Voice) -> anyhow::Result<(Vec<u8>, String)> {
+    let bytes = download_file(state, &voice.file.id).await?;
+    let mime = voice
+        .mime_type
+        .as_ref()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "audio/ogg".to_string());
+    Ok((bytes, mime))
+}
 
-    // Mark the pivot message (it's already in the buffer; pull it via before+1
-    // is awkward, so just flag the link's own message by id boundary).
-    if let Some(last) = messages.last_mut() {
-        // no-op guard to keep `last` used if before-list is empty
-        let _ = &last.message_id;
+async fn capture_ack(state: &AppState, msg: &Message, text: &str) {
+    if !state.config.tg_ack_on_capture {
+        return;
     }
-
-    let after = db::groups::messages_after(&state.pool, group_id, message_id, CONTEXT_AFTER)
+    let reacted = state
+        .bot
+        .set_message_reaction(msg.chat.id, msg.id)
+        .reaction(vec![ReactionType::Emoji {
+            emoji: "👀".to_string(),
+        }])
         .await
-        .unwrap_or_default();
-    messages.extend(after);
-
-    // Ensure the pivot itself is represented.
-    if !messages.iter().any(|m| m.message_id == message_id) {
-        messages.push(ContextMessage {
-            user_id: None,
-            username: None,
-            message_id,
-            text: String::new(),
-            position: ContextPosition::Pivot,
-        });
-        messages.sort_by_key(|m| m.message_id);
+        .is_ok();
+    if reacted {
+        return;
     }
-
-    ContextWindow {
-        messages,
-        forwarded,
-        forward_origin,
+    if let Err(e) = state
+        .bot
+        .send_message(msg.chat.id, text)
+        .reply_parameters(teloxide::types::ReplyParameters::new(msg.id))
+        .await
+    {
+        tracing::warn!(error = %e, "capture ack failed");
     }
 }
 
-// ── URL + forward helpers ───────────────────────────────────────────────────
-
-/// Extract http(s) URLs from free text (whitespace-token scan + validation).
-pub fn extract_urls(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for tok in text.split_whitespace() {
-        let tok = tok.trim_matches(|c: char| {
-            matches!(c, '(' | ')' | '[' | ']' | '<' | '>' | ',' | '"' | '\'' | '.' | '!' | '?')
-        });
-        if tok.starts_with("http://") || tok.starts_with("https://") {
-            if url::Url::parse(tok).is_ok() && !out.contains(&tok.to_string()) {
-                out.push(tok.to_string());
-            }
-        }
-    }
-    out
-}
+// ── Forward helpers ─────────────────────────────────────────────────────────
 
 fn is_telegram_link(url: &str) -> bool {
     crate::bot::formatter::domain_of(url)
@@ -252,5 +414,17 @@ fn mention_query(state: &AppState, text: &str) -> Option<String> {
         }
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telegram_links_skipped() {
+        assert!(is_telegram_link("https://t.me/nexus/123"));
+        assert!(is_telegram_link("https://telegram.me/foo"));
+        assert!(!is_telegram_link("https://example.com"));
     }
 }

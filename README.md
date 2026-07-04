@@ -1,13 +1,15 @@
 <h1 align="center">Nexus</h1>
 
 <p align="center">
-  <b>A group ambient-intelligence layer for Telegram.</b><br>
-  It silently reads every link your group shares, builds a private knowledge brain over it,
-  and answers questions like a researcher — or DMs you the moment something relevant lands.
+  <b>A context capture protocol.</b><br>
+  Forward anything — links, notes, voice notes, photos — from any connected chat channel.
+  Nexus builds a private knowledge brain over it and answers questions like a researcher,
+  so nothing you meant to keep gets lost in the noise of social media.
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
+  <a href="#channels">Channels</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#the-retrieval-pipeline">Retrieval</a> ·
   <a href="#deployment">Deploy</a> ·
@@ -16,26 +18,52 @@
 
 ---
 
-Add the bot to a Telegram group (or DM it). From then on it watches links in the
-background, ingests their **full content** (articles _and_ YouTube transcripts),
-splits it into searchable passages, builds a per-group **knowledge graph**, learns
-**what each member cares about**, and surfaces intelligence two ways:
+Social media is where you find things — and where you lose them. Nexus is the
+proper home for everything you meant to keep: forward it to the Nexus bot on
+whatever app you're already in, with zero typing or organizing. It ingests the
+**full content** (articles _and_ YouTube transcripts; voice notes transcribed;
+photos described), splits it into searchable passages, builds a **knowledge
+graph**, learns **what you care about**, and surfaces intelligence two ways:
 
-- **On demand** — `@mention` it or use `/ask`, and it runs a multi-stage retrieval
-  pipeline over everything the group has shared, then answers with cited sources.
-- **Proactively** — when one person shares something highly relevant to another's
-  interests, that person gets a **personal DM** with the exact relevant excerpt.
+- **On demand** — ask a question (`/ask`, `@mention`, or just message the bot),
+  and it runs a multi-stage retrieval pipeline over everything you've captured,
+  then answers with cited sources.
+- **Proactively** — in group spaces, when one person shares something highly
+  relevant to another's interests, that person gets a **personal DM** with the
+  exact relevant excerpt.
 
-It's a **closed-corpus brain**: it only knows what your group has shared, never
-the open web. The LLM supplies reasoning; the knowledge is strictly your group's
-collective attention.
+It's a **closed-corpus brain**: it only knows what you've captured, never the
+open web. The LLM supplies reasoning; the knowledge is strictly your own
+attention — a group's collective memory, or a personal capture inbox.
+
+---
+
+## Channels
+
+One brain, many doors. Every channel feeds the same identity-mapped intake,
+ingestion pipeline, and retrieval engine:
+
+| Channel       | Status     | Transport                           | Captures                               |
+| ------------- | ---------- | ----------------------------------- | -------------------------------------- |
+| **Telegram**  | ✅ live    | long-polling bot                    | links, forwards, group context         |
+| **WhatsApp**  | ✅ live    | Cloud API webhook (HTTPS via Caddy) | links, text notes, voice notes, photos |
+| **Instagram** | 🔜 planned | Messaging API webhook               | reels, posts, DM forwards              |
+| **X/Twitter** | 🔜 planned | DM webhook                          | tweets, threads                        |
+
+Each WhatsApp sender gets a personal space: their captures build their own
+brain, and questions in the same chat search only it. Internally every channel
+maps its native ids (chat ids, phone numbers, handles) onto one id space via
+`(channel, external_id)` — linking the same human across channels is on the
+roadmap.
 
 ---
 
 ## Features
 
+- 📥 **Zero-friction capture** — forward links, notes, voice notes, or photos to the bot on Telegram or WhatsApp; no commands, no folders, no typing.
 - 🔗 **Silent link ingestion** — every URL shared is fetched, extracted, and indexed. No commands needed.
 - 📺 **Articles + YouTube** — Readability-style extraction for pages; `yt-dlp` transcripts for videos.
+- 🎙️ **Voice notes & photos** — WhatsApp voice notes are transcribed (Whisper via any OpenAI-compatible STT), photos described by Claude vision; both become first-class, searchable knowledge.
 - 🧠 **Chunk-level RAG** — content is split into overlapping passages and embedded, so it reads the _whole_ document, not a summary.
 - 🔎 **Hybrid retrieval** — semantic (pgvector) **+** keyword (Postgres full-text), fused with Reciprocal Rank Fusion.
 - 🕸️ **Knowledge graph** — entities (people, companies, topics) and edges extracted across items; used to expand retrieval along connections.
@@ -50,15 +78,19 @@ collective attention.
 ## How it works
 
 ```
-Telegram update
-      │
-      ▼
- message handler ─┬─ URL?         → capture context window → ingestion queue
-                  ├─ forwarded?   → capture origin          → ingestion queue
-                  └─ /ask | @mention → query engine
+Telegram update            WhatsApp webhook (signed POST)
+      │                          │
+      ▼                          ▼
+ message handler          channel handler ── voice → STT · photo → vision
+      │                          │
+      └────────────┬─────────────┘
+                   ▼
+ intake (channel-agnostic) ─┬─ URL?      → context window → ingestion queue
+                            ├─ note/voice/photo → pre-extracted → queue
+                            └─ question  → query engine → reply on same channel
 
  ingestion worker (continuous):
-   fetch (article | youtube) → extract → summarize+tag (LLM)
+   fetch (article | youtube | pre-extracted) → extract → summarize+tag (LLM)
      → chunk into passages → embed each (local) → store
      → relevance scorer → DM anyone it's relevant to
 
@@ -159,6 +191,44 @@ TEST_DATABASE_URL=postgresql://nexus:nexus@localhost:5432/nexus \
 
 ---
 
+## WhatsApp setup
+
+WhatsApp runs over Meta's **Business Cloud API** (webhook-based — Meta POSTs
+inbound messages to you over HTTPS). Prerequisites have review lead time, so
+start them early:
+
+1. **Meta developer app** — create one, add the **WhatsApp** product, note the
+   **phone number id** and generate a **permanent system-user token** (the
+   API-Setup test token expires in 24h).
+2. **App secret** — App Settings → Basic → copy into `WA_APP_SECRET`. Every
+   webhook POST is signature-verified against it; unsigned traffic gets 401.
+3. **Expose the webhook** — deploy behind Caddy (or any TLS proxy; Meta requires
+   HTTPS), then in WhatsApp → Configuration set:
+   - Callback URL: `https://<your-domain>/webhook/whatsapp`
+   - Verify token: the same string as `WA_VERIFY_TOKEN`
+   - Subscribe to the **messages** field.
+4. **Fill the `WA_*` vars** in `.env` — the webhook server only starts when all
+   four are present.
+
+No Meta app yet? Drive the pipeline locally with the signed-payload simulator:
+
+```bash
+./scripts/simulate_whatsapp.sh text "check this https://youtu.be/dQw4w9WgXcQ"
+./scripts/simulate_whatsapp.sh text "where was that pasta place?"
+```
+
+What each message type does:
+
+| You send                    | Nexus does                                                            |
+| --------------------------- | --------------------------------------------------------------------- |
+| a link (or forwarded post)  | full ingestion — fetch, summarize, chunk, embed, graph                |
+| a text note                 | captured as a `note` item, same pipeline minus the fetch              |
+| a voice note                | transcribed, then captured as a `voice` item                          |
+| a photo (± caption)         | described by vision LLM, captured as an `image` item                  |
+| a question                  | runs the full `/ask` retrieval pipeline over **your** captures        |
+
+---
+
 ## Commands
 
 ```
@@ -212,6 +282,10 @@ Everything is set in `.env` (see [`.env.example`](.env.example)). Highlights:
 | ---------------------------------------------------------- | ---------------------------- | ---------------------------------------------------------------------- |
 | `TELEGRAM_BOT_TOKEN`                                       | —                            | required                                                               |
 | `DATABASE_URL`                                             | —                            | Postgres connection string                                             |
+| `WA_ACCESS_TOKEN` / `WA_PHONE_NUMBER_ID` / `WA_APP_SECRET` / `WA_VERIFY_TOKEN` | unset        | WhatsApp channel — all four or none; enables the webhook server        |
+| `PORT`                                                     | `8080`                       | webhook HTTP port (put Caddy in front for TLS)                         |
+| `WA_ACK_ON_CAPTURE`                                        | `true`                       | reply "✓ saved" after each WhatsApp capture                            |
+| `STT_BASE_URL` / `STT_MODEL` / `STT_API_KEY`               | Groq whisper                 | OpenAI-compatible transcription endpoint for voice notes               |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIM`                        | `mxbai-embed-large` / `1024` | embedding model + its dimension (must match; set at first boot)        |
 | `EMBEDDING_BASE_URL`                                       | local Ollama                 | OpenAI-compatible `/v1/embeddings` endpoint                            |
 | `TIER2_PROVIDER` / `GRAPH_PROVIDER` / `RAG_PROVIDER`       | `ollama`                     | per-tier chat backend: `ollama` (any OpenAI-compatible) or `anthropic` |
@@ -249,7 +323,8 @@ that dimension on first boot).
 
 | Table               | Purpose                                                                                                         |
 | ------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `groups`, `users`   | Telegram chats and members                                                                                      |
+| `groups`, `users`   | spaces and people, any channel — `(channel, external_id)` maps native ids onto internal BIGINTs                 |
+| `channel_events`    | webhook idempotency — Meta redeliveries are dropped on conflict                                                 |
 | `user_profiles`     | per-user, per-group **interest vector** + relevance threshold + mute                                            |
 | `items`             | one row per shared link: url, title, summary, tags, `content_type`, `context_window` (the moat), item embedding |
 | `chunks`            | passage-level text + embedding (the `/ask` retrieval unit) + a full-text index                                  |
@@ -270,14 +345,17 @@ src/
   config.rs, state.rs   typed env config; shared AppState
   models.rs             domain types (ContextWindow, RetrievedItem, …)
   bot/                  teloxide dispatcher, message handler, commands, HTML formatter
+  whatsapp/             Cloud API client, webhook types, signature verify, channel handler
+  http.rs               axum server for webhook channels (only runs when configured)
+  intake.rs             channel-agnostic capture: URL extraction, context windows, note scheduling
   ingestion/            queue consumer, fetcher, youtube transcripts, chunker, pipeline
-  llm/                  ModelTier, chat router (per-tier provider), Ollama/Anthropic/embeddings
-  db/                   sqlx access: items, chunks, entities, edges, graph, profiles, …
+  llm/                  ModelTier, chat router (per-tier provider), Ollama/Anthropic/embeddings/STT
+  db/                   sqlx access: items, chunks, entities, edges, graph, profiles, channels, …
   scorer/               vector math + the relevance interrupt
   graph/                Tier 4 batch entity/edge builder
   query/                the retrieval pipeline (expand → hybrid → graph → synth → self-correct)
   cron/                 scheduler + jobs
-migrations/             001–008 (schema, pgvector, profiles, buffer, notifications, content_type, chunks, FTS)
+migrations/             001–009 (schema, pgvector, profiles, buffer, notifications, content_type, chunks, FTS, channels)
 install.sh              one-shot VM installer
 docker-compose.yml      local Postgres + pgvector
 ```
@@ -288,14 +366,16 @@ docker-compose.yml      local Postgres + pgvector
 
 **Done:** silent ingestion · article + YouTube · chunk-level RAG · hybrid search ·
 knowledge graph + graph-aware retrieval · multi-query/HyDE · self-correcting
-synthesis · the relevance interrupt · per-tier model routing.
+synthesis · the relevance interrupt · per-tier model routing · **WhatsApp channel**
+(links, notes, voice, photos) · channel-agnostic identity layer.
 
-**Next:** X/Twitter ingestion · PDF support · a read-only web dashboard
-(force-directed graph + timeline + search) · podcast (Whisper) ingestion ·
-cross-group convergence signals.
+**Next:** Instagram + X/Twitter channels · cross-channel identity linking
+("registered usernames": one human, many handles) · PDF support · a read-only
+web dashboard (force-directed graph + timeline + search) · weekly resurfacing
+digest · cross-group convergence signals.
 
-The schema already carries `source` and `content_type`, so new input channels
-slot in without migration pain.
+The schema carries `channel`, `source`, and `content_type`, so new input
+channels slot in without migration pain.
 
 ---
 

@@ -5,6 +5,13 @@ use crate::db;
 use crate::models::RetrievedItem;
 use crate::state::AppState;
 use anyhow::Result;
+use uuid::Uuid;
+
+/// HTML reply plus cited item ids (for inline feedback buttons).
+pub struct QueryReply {
+    pub html: String,
+    pub cited_item_ids: Vec<Uuid>,
+}
 
 const SYSTEM_PROMPT: &str = "You are Nexus — a sharp research analyst and this \
 group's collective memory. Using the group's shared sources, write an insightful, \
@@ -37,7 +44,7 @@ const MAX_PASSAGES_PER_ITEM: usize = 3;
 /// search, the graph filter, and the model's own "answerable" gate.
 const MIN_SIMILARITY: f32 = 0.25;
 const NO_RESULTS: &str =
-    "Nothing in our shared history covers that yet. Keep sharing and I'll get smarter.";
+    "Nothing in your saved context covers that yet. Share links, notes, or voice memos and I'll get smarter.";
 
 /// A source item with the passages that matched the query.
 struct Source {
@@ -51,28 +58,40 @@ pub async fn handle(
     group_id: i64,
     user_id: i64,
     query_text: &str,
-) -> Result<String> {
+) -> Result<QueryReply> {
     let query_text = query_text.trim();
     if query_text.is_empty() {
-        return Ok(
-            "Ask me something — e.g. <code>/ask what have we seen on robotics funding?</code>"
+        return Ok(QueryReply {
+            html: "Ask me something — e.g. <code>/ask what have we seen on robotics funding?</code>"
                 .to_string(),
-        );
+            cited_item_ids: vec![],
+        });
     }
 
     // Tier 3: embed the query (also the interest signal below).
     let qvec = state.embedder.embed(query_text).await?;
 
     // Querying is the strongest interest signal (weight 3.0).
-    let _ = db::profiles::apply_weighted_update(
+    let _ = db::events::log(
         &state.pool,
         user_id,
-        group_id,
+        db::events::event_type::QUERY,
+        None,
+        3.0,
+        serde_json::json!({ "query": snippet(query_text, 120), "group_id": group_id }),
+    )
+    .await;
+    let _ = db::taste::apply_signal(
+        &state.pool,
+        user_id,
         &qvec,
         3.0,
         state.config.max_vector_weight,
         state.config.default_relevance_threshold,
+        state.config.taste_decay_lambda,
         &[],
+        true,
+        false,
         true,
     )
     .await;
@@ -99,12 +118,15 @@ pub async fn handle(
     // says the corpus can't answer and offers follow-up queries.
     let mut keyword_query = query_text.to_string();
     for attempt in 0..2u8 {
-        let hits = hybrid_retrieve(state, group_id, &keyword_query, &embeds).await;
+        let hits = hybrid_retrieve(state, user_id, &keyword_query, &embeds).await;
         let mut sources = group_hits(hits);
         let graph_added = expand_with_graph(state, group_id, query_text, &qvec, &mut sources).await;
 
         if sources.is_empty() {
-            return Ok(NO_RESULTS.to_string());
+            return Ok(QueryReply {
+                html: NO_RESULTS.to_string(),
+                cited_item_ids: vec![],
+            });
         }
         tracing::info!(group_id, attempt, sources = sources.len(), graph_added, "ask context");
 
@@ -116,13 +138,23 @@ pub async fn handle(
         match resolve_outcome(&raw, items.len()) {
             AnswerOutcome::Answered { answer, cited } => {
                 tracing::info!(group_id, attempt, answered = true, cited = cited.len(), "ask answered");
-                return Ok(formatter::query_answer(&answer, &items, &cited, group_id));
+                let cited_item_ids: Vec<Uuid> = cited
+                    .iter()
+                    .filter_map(|n| items.get(n - 1).map(|i| i.id))
+                    .collect();
+                return Ok(QueryReply {
+                    html: formatter::query_answer(&answer, &items, &cited, group_id),
+                    cited_item_ids,
+                });
             }
             AnswerOutcome::NeedMore { follow_up } => {
                 // Out of retries, or no leads to chase → give up gracefully.
                 if attempt >= 1 || follow_up.is_empty() {
                     tracing::info!(group_id, attempt, answered = false, "ask answered");
-                    return Ok(NO_RESULTS.to_string());
+                    return Ok(QueryReply {
+                        html: NO_RESULTS.to_string(),
+                        cited_item_ids: vec![],
+                    });
                 }
                 // Second-pass retrieval targeting the gap the model flagged.
                 tracing::info!(group_id, follow_ups = follow_up.len(), "ask self-correcting");
@@ -136,24 +168,31 @@ pub async fn handle(
         }
     }
 
-    Ok(NO_RESULTS.to_string())
+    Ok(QueryReply {
+        html: NO_RESULTS.to_string(),
+        cited_item_ids: vec![],
+    })
 }
 
 /// Hybrid retrieval over multiple query embeddings: vector search per embedding
 /// + one keyword search, all fused with RRF.
 async fn hybrid_retrieve(
     state: &AppState,
-    group_id: i64,
+    owner_user_id: i64,
     keyword_query: &str,
     embeds: &[Vec<f32>],
 ) -> Vec<crate::db::chunks::ChunkHit> {
     let mut lists = Vec::new();
     for e in embeds {
-        if let Ok(h) = db::chunks::search(&state.pool, group_id, e, CHUNK_K, MIN_SIMILARITY).await {
+        if let Ok(h) =
+            db::chunks::search_by_owner(&state.pool, owner_user_id, e, CHUNK_K, MIN_SIMILARITY).await
+        {
             lists.push(h);
         }
     }
-    match db::chunks::keyword_search(&state.pool, group_id, keyword_query, CHUNK_K).await {
+    match db::chunks::keyword_search_by_owner(&state.pool, owner_user_id, keyword_query, CHUNK_K)
+        .await
+    {
         Ok(k) => lists.push(k),
         Err(e) => tracing::debug!(error = %e, "keyword search failed"),
     }
@@ -390,6 +429,8 @@ fn group_hits(hits: Vec<crate::db::chunks::ChunkHit>) -> Vec<Source> {
                     message_id: hit.message_id,
                     shared_at: hit.shared_at,
                     similarity: hit.similarity,
+                    source_channel: hit.source_channel.clone(),
+                    content_type: hit.content_type.clone(),
                 },
                 passages: Vec::new(),
             }
@@ -520,6 +561,8 @@ mod tests {
             shared_at: chrono::Utc::now(),
             content: "c".into(),
             similarity: 0.0,
+            source_channel: Some("telegram".into()),
+            content_type: Some("article".into()),
         }
     }
 

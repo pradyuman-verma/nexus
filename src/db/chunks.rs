@@ -20,6 +20,8 @@ pub struct ChunkHit {
     pub shared_at: DateTime<Utc>,
     pub content: String,
     pub similarity: f32,
+    pub source_channel: Option<String>,
+    pub content_type: Option<String>,
 }
 
 /// Replace an item's chunks with a fresh set. `rows` is `(index, content, embedding)`.
@@ -27,6 +29,7 @@ pub async fn replace_for_item(
     pool: &PgPool,
     item_id: Uuid,
     group_id: i64,
+    owner_user_id: i64,
     rows: &[(i32, String, Vec<f32>)],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
@@ -39,12 +42,13 @@ pub async fn replace_for_item(
         let vec = Vector::from(embedding.clone());
         sqlx::query(
             r#"
-            INSERT INTO chunks (item_id, group_id, chunk_index, content, embedding)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO chunks (item_id, group_id, owner_user_id, chunk_index, content, embedding)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(item_id)
         .bind(group_id)
+        .bind(owner_user_id)
         .bind(idx)
         .bind(content)
         .bind(vec)
@@ -68,6 +72,7 @@ pub async fn search(
         r#"
         SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
                i.message_id, i.shared_at, c.content,
+               i.source_channel, i.content_type,
                1 - (c.embedding <=> $2) AS similarity
         FROM chunks c
         JOIN items i ON i.id = c.item_id
@@ -85,6 +90,74 @@ pub async fn search(
     .fetch_all(pool)
     .await?;
 
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// Top-k passages in a user's personal corpus by cosine similarity.
+pub async fn search_by_owner(
+    pool: &PgPool,
+    owner_user_id: i64,
+    query: &[f32],
+    limit: i64,
+    min_similarity: f32,
+) -> Result<Vec<ChunkHit>> {
+    let qvec = Vector::from(query.to_vec());
+    let rows: Vec<ChunkRow> = sqlx::query_as(
+        r#"
+        SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
+               i.message_id, i.shared_at, c.content,
+               i.source_channel, i.content_type,
+               1 - (c.embedding <=> $2) AS similarity
+        FROM chunks c
+        JOIN items i ON i.id = c.item_id
+        LEFT JOIN users u ON u.id = i.shared_by
+        WHERE c.owner_user_id = $1 AND c.embedding IS NOT NULL
+          AND 1 - (c.embedding <=> $2) > $3
+        ORDER BY c.embedding <=> $2 ASC
+        LIMIT $4
+        "#,
+    )
+    .bind(owner_user_id)
+    .bind(qvec)
+    .bind(min_similarity as f64)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// Keyword search over a user's personal corpus.
+pub async fn keyword_search_by_owner(
+    pool: &PgPool,
+    owner_user_id: i64,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<ChunkHit>> {
+    let rows: Vec<ChunkRow> = sqlx::query_as(
+        r#"
+        WITH q AS (
+            SELECT replace(plainto_tsquery('english', $2)::text, '&', '|')::tsquery AS tsq
+        )
+        SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
+               i.message_id, i.shared_at, c.content,
+               i.source_channel, i.content_type,
+               ts_rank(to_tsvector('english', c.content), (SELECT tsq FROM q)) AS similarity
+        FROM chunks c
+        JOIN items i ON i.id = c.item_id
+        LEFT JOIN users u ON u.id = i.shared_by
+        WHERE c.owner_user_id = $1
+          AND (SELECT tsq FROM q) != ''::tsquery
+          AND to_tsvector('english', c.content) @@ (SELECT tsq FROM q)
+        ORDER BY similarity DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(owner_user_id)
+    .bind(query)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
@@ -106,6 +179,7 @@ pub async fn search_within_items(
         r#"
         SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
                i.message_id, i.shared_at, c.content,
+               i.source_channel, i.content_type,
                1 - (c.embedding <=> $2) AS similarity
         FROM chunks c
         JOIN items i ON i.id = c.item_id
@@ -144,6 +218,7 @@ pub async fn keyword_search(
         )
         SELECT c.id, c.item_id, i.url, i.title, i.summary, i.shared_by, u.username,
                i.message_id, i.shared_at, c.content,
+               i.source_channel, i.content_type,
                ts_rank(to_tsvector('english', c.content), (SELECT tsq FROM q)) AS similarity
         FROM chunks c
         JOIN items i ON i.id = c.item_id
@@ -169,9 +244,10 @@ pub async fn items_missing_chunks(
     group_id: i64,
     limit: i64,
 ) -> Result<Vec<MissingItem>> {
-    let rows: Vec<(Uuid, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+    let rows: Vec<(Uuid, Option<String>, Option<String>, Option<String>, Option<i64>)> =
+        sqlx::query_as(
         r#"
-        SELECT i.id, i.title, i.summary, i.raw_content
+        SELECT i.id, i.title, i.summary, i.raw_content, i.owner_user_id
         FROM items i
         WHERE i.group_id = $1
           AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.item_id = i.id)
@@ -186,11 +262,12 @@ pub async fn items_missing_chunks(
 
     Ok(rows
         .into_iter()
-        .map(|(id, title, summary, raw_content)| MissingItem {
+        .map(|(id, title, summary, raw_content, owner_user_id)| MissingItem {
             id,
             title,
             summary,
             raw_content,
+            owner_user_id,
         })
         .collect())
 }
@@ -200,6 +277,7 @@ pub struct MissingItem {
     pub title: Option<String>,
     pub summary: Option<String>,
     pub raw_content: Option<String>,
+    pub owner_user_id: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -214,6 +292,8 @@ struct ChunkRow {
     message_id: Option<i64>,
     shared_at: DateTime<Utc>,
     content: String,
+    source_channel: Option<String>,
+    content_type: Option<String>,
     similarity: Option<f64>,
 }
 
@@ -231,6 +311,8 @@ impl From<ChunkRow> for ChunkHit {
             shared_at: r.shared_at,
             content: r.content,
             similarity: r.similarity.unwrap_or(0.0) as f32,
+            source_channel: r.source_channel,
+            content_type: r.content_type,
         }
     }
 }

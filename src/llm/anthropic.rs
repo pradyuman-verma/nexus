@@ -57,7 +57,34 @@ impl Anthropic {
         if let Some(s) = system {
             body["system"] = json!(s);
         }
+        self.call(&body).await
+    }
 
+    /// Describe an image (base64 content block + instruction), on Haiku.
+    pub async fn describe_image(&self, image: &[u8], media_type: &str, prompt: &str) -> Result<String> {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        let body = json!({
+            "model": &self.haiku_model,
+            "max_tokens": 512,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": B64.encode(image),
+                        }
+                    },
+                    { "type": "text", "text": prompt }
+                ]
+            }],
+        });
+        self.call(&body).await
+    }
+
+    async fn call(&self, body: &serde_json::Value) -> Result<String> {
         let mut last_err = None;
         for attempt in 0..2u8 {
             if attempt > 0 {

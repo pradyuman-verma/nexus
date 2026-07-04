@@ -64,7 +64,9 @@ async fn full_db_roundtrip() {
         &pool,
         NewItem {
             group_id,
+            owner_user_id: sharer,
             shared_by: sharer,
+            source_channel: "telegram",
             url: "https://example.com/robotics-fund",
             message_id: 42,
             title: Some("Robotics megafund"),
@@ -73,6 +75,7 @@ async fn full_db_roundtrip() {
             tags: &tags,
             category: Some("venture"),
             context_window: &ctx,
+            context_signals: None,
             embedding: Some(&emb),
             fetch_status: "ok",
             content_type: "article",

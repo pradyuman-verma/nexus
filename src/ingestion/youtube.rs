@@ -16,7 +16,10 @@ const MAX_TRANSCRIPT_CHARS: usize = 40_000;
 
 /// True if the URL points at YouTube (any of its host/path forms).
 pub fn is_youtube(url: &str) -> bool {
-    match url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)) {
+    match url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+    {
         Some(host) => {
             let h = host.trim_start_matches("www.").to_lowercase();
             matches!(
@@ -32,7 +35,10 @@ pub fn is_youtube(url: &str) -> bool {
 pub async fn fetch(url: &str, ytdlp_path: &str) -> Result<ExtractedContent> {
     let meta = run_ytdlp_json(url, ytdlp_path).await?;
 
-    let title = meta.get("title").and_then(Value::as_str).map(str::to_string);
+    let title = meta
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let author = meta
         .get("uploader")
         .or_else(|| meta.get("channel"))
@@ -77,7 +83,13 @@ pub async fn fetch(url: &str, ytdlp_path: &str) -> Result<ExtractedContent> {
 
 async fn run_ytdlp_json(url: &str, ytdlp_path: &str) -> Result<Value> {
     let fut = Command::new(ytdlp_path)
-        .args(["-J", "--skip-download", "--no-warnings", "--no-playlist", url])
+        .args([
+            "-J",
+            "--skip-download",
+            "--no-warnings",
+            "--no-playlist",
+            url,
+        ])
         .output();
 
     let out = tokio::time::timeout(YTDLP_TIMEOUT, fut)

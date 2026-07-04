@@ -8,9 +8,11 @@ use nexus::llm::anthropic::Anthropic;
 use nexus::llm::chat::Chat;
 use nexus::llm::embeddings::Embedder;
 use nexus::llm::ollama::Ollama;
+use nexus::llm::stt::Stt;
 use nexus::models::IngestionJob;
 use nexus::state::AppState;
-use nexus::{bot, cron, db, ingestion};
+use nexus::whatsapp::WhatsApp;
+use nexus::{bot, cron, db, http, ingestion};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -60,10 +62,30 @@ async fn main() -> Result<()> {
     );
 
     // ── Telegram ────────────────────────────────────────────────────────────
-    let bot = Bot::new(&config.telegram_bot_token);
+    let mut bot = Bot::new(&config.telegram_bot_token);
+    if let Some(api_url) = &config.telegram_api_url {
+        bot = bot.set_api_url(api_url.parse().context("parsing TELEGRAM_API_URL")?);
+    }
     let me = bot.get_me().await.context("get_me failed — check TELEGRAM_BOT_TOKEN")?;
     let bot_username = me.username().to_string();
     tracing::info!(bot = %bot_username, "telegram connected");
+
+    // ── Channel clients ─────────────────────────────────────────────────────
+    let wa = config.whatsapp.as_ref().map(|w| {
+        Arc::new(WhatsApp::new(
+            w.graph_base_url.clone(),
+            w.access_token.clone(),
+            w.phone_number_id.clone(),
+            w.api_version.clone(),
+        ))
+    });
+    let stt = config.stt_api_key.clone().map(|key| {
+        Arc::new(Stt::new(
+            config.stt_base_url.clone(),
+            key,
+            config.stt_model.clone(),
+        ))
+    });
 
     // ── Wiring ──────────────────────────────────────────────────────────────
     let (tx, rx) = mpsc::channel::<IngestionJob>(INGESTION_QUEUE_CAP);
@@ -76,12 +98,25 @@ async fn main() -> Result<()> {
         embedder,
         bot_username: Arc::new(bot_username.to_lowercase()),
         ingestion_tx: tx.clone(),
+        wa,
+        stt,
     };
 
     // Ingestion consumer (continuous background task).
     {
         let state = state.clone();
         tokio::spawn(async move { ingestion::run_consumer(state, rx).await });
+    }
+
+    // Webhook server — only when a webhook channel (WhatsApp) is configured.
+    if state.config.whatsapp.is_some() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = http::serve(state).await {
+                tracing::error!(error = %e, "webhook server died — WhatsApp ingress is down");
+            }
+        });
+        tracing::info!("whatsapp channel enabled");
     }
 
     // Cron scheduler. Keep the handle alive for the process lifetime.

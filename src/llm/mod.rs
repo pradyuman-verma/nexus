@@ -12,6 +12,7 @@ pub mod anthropic;
 pub mod chat;
 pub mod embeddings;
 pub mod ollama;
+pub mod stt;
 
 /// Which backend serves a given chat tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

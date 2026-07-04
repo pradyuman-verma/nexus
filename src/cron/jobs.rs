@@ -31,6 +31,12 @@ pub async fn cleanup(state: &AppState) {
     if let Err(e) = log_group_stats(state).await {
         tracing::warn!(error = %e, "group stats logging failed");
     }
+
+    match db::taste::calibrate_all(&state.pool, state.config.default_relevance_threshold).await {
+        Ok(n) if n > 0 => tracing::info!(raised = n, "taste threshold calibration"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "taste calibration failed"),
+    }
 }
 
 async fn log_group_stats(state: &AppState) -> Result<()> {

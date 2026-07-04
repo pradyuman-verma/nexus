@@ -73,7 +73,9 @@ mod tests {
         let chunks = chunk_with(&text, 1000, 100);
         assert!(chunks.len() > 1);
         // Every chunk is within bounds and non-empty.
-        assert!(chunks.iter().all(|c| !c.is_empty() && c.chars().count() <= 1000));
+        assert!(chunks
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().count() <= 1000));
     }
 
     #[test]

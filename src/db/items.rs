@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 pub struct NewItem<'a> {
     pub group_id: i64,
+    pub owner_user_id: i64,
     pub shared_by: i64,
+    pub source_channel: &'a str,
     pub url: &'a str,
     pub message_id: i64,
     pub title: Option<&'a str>,
@@ -18,6 +20,7 @@ pub struct NewItem<'a> {
     pub tags: &'a [String],
     pub category: Option<&'a str>,
     pub context_window: &'a ContextWindow,
+    pub context_signals: Option<&'a crate::models::ContextSignals>,
     pub embedding: Option<&'a [f32]>,
     pub fetch_status: &'a str,
     pub content_type: &'a str,
@@ -50,19 +53,26 @@ pub async fn is_duplicate(
 pub async fn insert(pool: &PgPool, item: NewItem<'_>) -> Result<Option<Uuid>> {
     let embedding = item.embedding.map(|e| Vector::from(e.to_vec()));
     let ctx = serde_json::to_value(item.context_window)?;
+    let signals = item
+        .context_signals
+        .map(serde_json::to_value)
+        .transpose()?;
 
     let row: Option<(Uuid,)> = sqlx::query_as(
         r#"
         INSERT INTO items
-            (group_id, shared_by, url, message_id, title, raw_content,
-             summary, tags, category, context_window, embedding, fetch_status, content_type)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            (group_id, owner_user_id, shared_by, source_channel, url, message_id,
+             title, raw_content, summary, tags, category, context_window,
+             context_signals, embedding, fetch_status, content_type, source)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$4)
         ON CONFLICT DO NOTHING
         RETURNING id
         "#,
     )
     .bind(item.group_id)
+    .bind(item.owner_user_id)
     .bind(item.shared_by)
+    .bind(item.source_channel)
     .bind(item.url)
     .bind(item.message_id)
     .bind(item.title)
@@ -71,6 +81,7 @@ pub async fn insert(pool: &PgPool, item: NewItem<'_>) -> Result<Option<Uuid>> {
     .bind(item.tags)
     .bind(item.category)
     .bind(ctx)
+    .bind(signals)
     .bind(embedding)
     .bind(item.fetch_status)
     .bind(item.content_type)
@@ -95,6 +106,7 @@ pub async fn search(
         r#"
         SELECT i.id, i.url, i.title, i.summary, i.raw_content, i.tags, i.category,
                i.context_window, i.shared_by, u.username, i.message_id, i.shared_at,
+               i.source_channel, i.content_type,
                1 - (i.embedding <=> $2) AS similarity
         FROM items i
         LEFT JOIN users u ON u.id = i.shared_by
@@ -221,6 +233,17 @@ pub async fn raw_content(pool: &PgPool, id: Uuid) -> Result<Option<String>> {
     Ok(row.and_then(|(c,)| c))
 }
 
+/// Embedding + tags for taste feedback on a specific item.
+pub async fn signal_source(pool: &PgPool, id: Uuid) -> Result<Option<(Vec<f32>, Vec<String>)>> {
+    let row: Option<(Option<Vector>, Vec<String>)> = sqlx::query_as(
+        "SELECT embedding, tags FROM items WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(emb, tags)| (emb.map(|v| v.to_vec()).unwrap_or_default(), tags)))
+}
+
 // ── internal row mapping ────────────────────────────────────────────────────
 
 #[derive(sqlx::FromRow)]
@@ -237,6 +260,8 @@ struct ItemRow {
     username: Option<String>,
     message_id: Option<i64>,
     shared_at: DateTime<Utc>,
+    source_channel: Option<String>,
+    content_type: Option<String>,
     similarity: Option<f64>,
 }
 
@@ -258,6 +283,8 @@ impl From<ItemRow> for RetrievedItem {
             message_id: r.message_id,
             shared_at: r.shared_at,
             similarity: r.similarity.unwrap_or(0.0) as f32,
+            source_channel: r.source_channel,
+            content_type: r.content_type,
         }
     }
 }

@@ -5,10 +5,43 @@ use crate::llm::Provider;
 use anyhow::{Context, Result};
 use std::env;
 
+/// WhatsApp Cloud API channel — present only when the WA_* env vars are set.
+#[derive(Debug, Clone)]
+pub struct WhatsAppConfig {
+    /// Permanent system-user token with whatsapp_business_messaging scope.
+    pub access_token: String,
+    /// The sender phone number id (NOT the display number).
+    pub phone_number_id: String,
+    /// Meta app secret — signs every webhook POST (X-Hub-Signature-256).
+    pub app_secret: String,
+    /// Arbitrary string; must match what you type into the Meta webhook UI.
+    pub verify_token: String,
+    pub api_version: String,
+    /// Meta Graph API root — overridable so local dev can point at a stub.
+    pub graph_base_url: String,
+    /// Reply "✓ saved" after each capture. Nice while testing; can go quiet.
+    pub ack_on_capture: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub telegram_bot_token: String,
+    /// Override for local testing against a stub Telegram API; None = real.
+    pub telegram_api_url: Option<String>,
+    /// React 👀 or reply "✓ saved" after each Telegram capture.
+    pub tg_ack_on_capture: bool,
     pub database_url: String,
+
+    // ── Webhook channels (WhatsApp now, IG/Twitter later) ───────────────
+    pub whatsapp: Option<WhatsAppConfig>,
+    /// Port for the webhook HTTP server (behind Caddy for TLS).
+    pub http_port: u16,
+
+    // ── Speech-to-text (voice note captures) ────────────────────────────
+    /// Any OpenAI-compatible /v1/audio/transcriptions endpoint.
+    pub stt_base_url: String,
+    pub stt_api_key: Option<String>,
+    pub stt_model: String,
 
     // ── Chat (Tiers 2/4/5) ──────────────────────────────────────────────
     /// Optional — only required if any tier routes to Anthropic.
@@ -43,6 +76,8 @@ pub struct Config {
     pub health_cron_schedule: String,
     pub default_relevance_threshold: f32,
     pub max_vector_weight: f32,
+    /// Exponential decay on taste vector weight (per day). 0 disables decay.
+    pub taste_decay_lambda: f32,
     pub notification_score_log: bool,
     pub url_dedup_days: i64,
 }
@@ -65,7 +100,16 @@ impl Config {
 
         Ok(Self {
             telegram_bot_token: req("TELEGRAM_BOT_TOKEN")?,
+            telegram_api_url: env::var("TELEGRAM_API_URL").ok().filter(|s| !s.is_empty()),
+            tg_ack_on_capture: opt("TG_ACK_ON_CAPTURE", "true") == "true",
             database_url: req("DATABASE_URL")?,
+
+            whatsapp: whatsapp_from_env()?,
+            http_port: opt("PORT", "8080").parse().unwrap_or(8080),
+
+            stt_base_url: opt("STT_BASE_URL", "https://api.groq.com/openai/v1"),
+            stt_api_key: env::var("STT_API_KEY").ok().filter(|s| !s.is_empty()),
+            stt_model: opt("STT_MODEL", "whisper-large-v3-turbo"),
 
             anthropic_api_key: env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty()),
             haiku_model: opt("HAIKU_MODEL", "claude-haiku-4-5-20251001"),
@@ -93,6 +137,7 @@ impl Config {
                 .parse()
                 .unwrap_or(0.72),
             max_vector_weight: opt("MAX_VECTOR_WEIGHT", "100.0").parse().unwrap_or(100.0),
+            taste_decay_lambda: opt("TASTE_DECAY_LAMBDA", "0.02").parse().unwrap_or(0.02),
             notification_score_log: opt("NOTIFICATION_SCORE_LOG", "true") == "true",
             url_dedup_days: opt("URL_DEDUP_DAYS", "7").parse().unwrap_or(7),
         })
@@ -112,6 +157,41 @@ impl Config {
             .iter()
             .any(|p| *p == Provider::Ollama)
     }
+}
+
+/// All four WA_* vars present → Some; none present → None; a partial set
+/// is a config mistake and fails fast.
+fn whatsapp_from_env() -> Result<Option<WhatsAppConfig>> {
+    const KEYS: [&str; 4] = [
+        "WA_ACCESS_TOKEN",
+        "WA_PHONE_NUMBER_ID",
+        "WA_APP_SECRET",
+        "WA_VERIFY_TOKEN",
+    ];
+    let set: Vec<&str> = KEYS
+        .iter()
+        .copied()
+        .filter(|k| env::var(k).map(|v| !v.is_empty()).unwrap_or(false))
+        .collect();
+    if set.is_empty() {
+        return Ok(None);
+    }
+    if set.len() < KEYS.len() {
+        anyhow::bail!(
+            "partial WhatsApp config: {} set but all of {} are required",
+            set.join(", "),
+            KEYS.join(", ")
+        );
+    }
+    Ok(Some(WhatsAppConfig {
+        access_token: req("WA_ACCESS_TOKEN")?,
+        phone_number_id: req("WA_PHONE_NUMBER_ID")?,
+        app_secret: req("WA_APP_SECRET")?,
+        verify_token: req("WA_VERIFY_TOKEN")?,
+        api_version: opt("WA_API_VERSION", "v20.0"),
+        graph_base_url: opt("GRAPH_BASE_URL", "https://graph.facebook.com"),
+        ack_on_capture: opt("WA_ACK_ON_CAPTURE", "true") == "true",
+    }))
 }
 
 fn req(key: &str) -> Result<String> {
