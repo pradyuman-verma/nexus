@@ -195,6 +195,7 @@ pub async fn try_handle(
             let req = parse_ask_args(chat_id, args);
             let anchor = QueryAnchor {
                 reply_message_id: reply_target_message_id,
+                query_message_id: Some(reply_to as i64),
             };
             let reply = run_query(
                 state,

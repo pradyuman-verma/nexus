@@ -74,6 +74,11 @@ pub fn is_deictic_query(text: &str) -> bool {
         "what we just",
         "just shared",
         "just sent",
+        "from this",
+        "about this",
+        "understand this",
+        "help me understand",
+        "pointers from",
     ];
     PHRASES.iter().any(|p| t.contains(p))
 }

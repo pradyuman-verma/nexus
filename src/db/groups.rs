@@ -162,6 +162,59 @@ pub async fn messages_after(
         .collect())
 }
 
+/// Recent messages from a user that contain URLs, newest first.
+/// Skips messages at or after `before_message_id` when set (the /ask message itself).
+pub async fn recent_urls_from_user(
+    pool: &PgPool,
+    group_id: i64,
+    user_id: i64,
+    before_message_id: Option<i64>,
+    scan_limit: i64,
+) -> Result<Vec<(i64, String)>> {
+    let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT message_id, text
+        FROM messages_buffer
+        WHERE group_id = $1 AND user_id = $2 AND text IS NOT NULL
+          AND ($3::bigint IS NULL OR message_id < $3)
+        ORDER BY message_id DESC
+        LIMIT $4
+        "#,
+    )
+    .bind(group_id)
+    .bind(user_id)
+    .bind(before_message_id)
+    .bind(scan_limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::new();
+    for (message_id, text) in rows {
+        let Some(text) = text else { continue };
+        if let Some(url) = crate::intake::extract_urls(&text).into_iter().next() {
+            out.push((message_id, url));
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Buffered text for a specific message (for reply-to before ingest completes).
+pub async fn buffer_text(
+    pool: &PgPool,
+    group_id: i64,
+    message_id: i64,
+) -> Result<Option<String>> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT text FROM messages_buffer WHERE group_id = $1 AND message_id = $2",
+    )
+    .bind(group_id)
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(t,)| t))
+}
+
 /// Delete buffer rows older than 48h. Returns rows removed.
 pub async fn purge_old_buffer(pool: &PgPool) -> Result<u64> {
     let res = sqlx::query(

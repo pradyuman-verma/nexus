@@ -177,6 +177,7 @@ async fn handle_inner(state: &AppState, msg: &Message) -> anyhow::Result<()> {
         tracing::info!(chat_id, user = uid, "telegram query");
         let anchor = query::QueryAnchor {
             reply_message_id: msg.reply_to_message().map(|m| m.id.0 as i64),
+            query_message_id: Some(message_id),
         };
         let reply = commands::run_query(
             state,

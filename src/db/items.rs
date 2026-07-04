@@ -299,6 +299,60 @@ pub async fn latest_in_chat(
     Ok(row.map(Into::into))
 }
 
+/// Fuzzy URL match within a chat (handles truncated preview links).
+pub async fn by_url_in_chat(
+    pool: &PgPool,
+    group_id: i64,
+    url: &str,
+) -> Result<Option<RetrievedItem>> {
+    let row: Option<ItemRow> = sqlx::query_as(
+        r#"
+        SELECT i.id, i.url, i.title, i.summary, i.raw_content, i.tags, i.category,
+               i.context_window, i.shared_by, u.username, i.message_id, i.shared_at,
+               i.source_channel, i.content_type, i.group_id,
+               1.0 AS similarity
+        FROM items i
+        LEFT JOIN users u ON u.id = i.shared_by
+        WHERE i.group_id = $1
+          AND (i.url = $2 OR i.url LIKE $2 || '%' OR $2 LIKE i.url || '%')
+        ORDER BY i.shared_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(group_id)
+    .bind(url)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(Into::into))
+}
+
+/// Most recent capture in a chat (for "this"/"that" without reply).
+pub async fn latest_in_chat_any(
+    pool: &PgPool,
+    group_id: i64,
+    within_minutes: i64,
+) -> Result<Option<RetrievedItem>> {
+    let row: Option<ItemRow> = sqlx::query_as(
+        r#"
+        SELECT i.id, i.url, i.title, i.summary, i.raw_content, i.tags, i.category,
+               i.context_window, i.shared_by, u.username, i.message_id, i.shared_at,
+               i.source_channel, i.content_type, i.group_id,
+               1.0 AS similarity
+        FROM items i
+        LEFT JOIN users u ON u.id = i.shared_by
+        WHERE i.group_id = $1
+          AND i.shared_at > NOW() - ($2 || ' minutes')::interval
+        ORDER BY i.shared_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(group_id)
+    .bind(within_minutes.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(Into::into))
+}
+
 // ── internal row mapping ────────────────────────────────────────────────────
 
 #[derive(sqlx::FromRow)]

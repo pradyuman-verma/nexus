@@ -38,6 +38,8 @@ pub enum WebMode {
 pub struct QueryAnchor {
     /// Telegram message id of the capture being asked about (from reply_to).
     pub reply_message_id: Option<i64>,
+    /// The message containing the question (excluded from "latest URL" scans).
+    pub query_message_id: Option<i64>,
 }
 
 const SYSTEM_PROMPT_PERSONAL: &str = "You are Nexus — a sharp research analyst for \
@@ -116,11 +118,22 @@ const NO_RESULTS_PERSONAL: &str =
     "Nothing in your saved context covers that yet. Share links, notes, or voice memos and I'll get smarter.";
 const NO_RESULTS_GROUP: &str =
     "Nothing shared in this chat covers that yet. Share a link here and I'll index it.";
+const STILL_READING: &str =
+    "I'm still reading that link — give me about a minute after you share, then ask again.";
+const DEICTIC_NO_REFERENT: &str =
+    "Not sure which item you mean — reply directly to the link or note you're asking about.";
 
 /// A source item with the passages that matched the query.
 struct Source {
     item: RetrievedItem,
     passages: Vec<String>,
+}
+
+enum AnchorResolve {
+    Ready(RetrievedItem),
+    /// URL seen in chat but ingest hasn't finished yet.
+    Pending { url: String },
+    None,
 }
 
 /// Handle a `/ask` / @mention query. Returns the HTML reply to send.
@@ -146,9 +159,29 @@ pub async fn handle(
         return handle_web_only(state, query_text).await;
     }
 
-    let anchor_item = resolve_anchor(state, chat_id, user_id, &anchor, query_text).await;
-    let focused = anchor_item.is_some()
-        && (anchor.reply_message_id.is_some() || crate::intake::is_deictic_query(query_text));
+    let resolved = resolve_anchor(state, chat_id, user_id, &anchor, query_text).await;
+    let deictic = crate::intake::is_deictic_query(query_text);
+    let (anchor_item, focused) = match &resolved {
+        AnchorResolve::Ready(item) => {
+            let focused = anchor.reply_message_id.is_some() || deictic;
+            (Some(item.clone()), focused)
+        }
+        AnchorResolve::Pending { url } => {
+            tracing::info!(chat_id, user_id, url = %url, "ask anchor pending ingest");
+            return Ok(QueryReply {
+                html: format!("{STILL_READING}\n\n<code>{}</code>", esc_url(url)),
+                cited_item_ids: vec![],
+            });
+        }
+        AnchorResolve::None if deictic => {
+            tracing::info!(chat_id, user_id, "ask deictic without referent");
+            return Ok(QueryReply {
+                html: DEICTIC_NO_REFERENT.to_string(),
+                cited_item_ids: vec![],
+            });
+        }
+        AnchorResolve::None => (None, false),
+    };
     if focused {
         tracing::info!(
             chat_id,
@@ -175,7 +208,7 @@ pub async fn handle(
     };
 
     // Tier 3: embed the query (also the interest signal below).
-    let embed_text = if let Some(item) = &anchor_item {
+    let embed_text = if let Some(item) = anchor_item.as_ref() {
         anchor_aware_query(query_text, item)
     } else {
         query_text.to_string()
@@ -636,20 +669,76 @@ async fn resolve_anchor(
     user_id: i64,
     anchor: &QueryAnchor,
     query_text: &str,
-) -> Option<RetrievedItem> {
+) -> AnchorResolve {
+    // 1. Explicit reply-to a message.
     if let Some(mid) = anchor.reply_message_id {
-        if let Ok(Some(item)) = db::items::by_message(&state.pool, chat_id, mid).await {
-            return Some(item);
-        }
+        return resolve_message_target(state, chat_id, mid).await;
     }
+
+    // 2. Deictic ("this", "that") — prefer the most recent URL in chat buffer
+    //    over DB recency (the latest link may still be ingesting).
     if crate::intake::is_deictic_query(query_text) {
-        if let Ok(Some(item)) =
-            db::items::latest_in_chat(&state.pool, chat_id, user_id, 15).await
+        if let Ok(urls) = db::groups::recent_urls_from_user(
+            &state.pool,
+            chat_id,
+            user_id,
+            anchor.query_message_id,
+            12,
+        )
+        .await
         {
-            return Some(item);
+            for (mid, url) in urls {
+                if let AnchorResolve::Ready(item) =
+                    resolve_message_target(state, chat_id, mid).await
+                {
+                    return AnchorResolve::Ready(item);
+                }
+                if let Ok(Some(item)) = db::items::by_url_in_chat(&state.pool, chat_id, &url).await
+                {
+                    return AnchorResolve::Ready(item);
+                }
+                return AnchorResolve::Pending { url };
+            }
+        }
+
+        if let Ok(Some(item)) =
+            db::items::latest_in_chat(&state.pool, chat_id, user_id, 30).await
+        {
+            return AnchorResolve::Ready(item);
+        }
+        if let Ok(Some(item)) = db::items::latest_in_chat_any(&state.pool, chat_id, 30).await {
+            return AnchorResolve::Ready(item);
         }
     }
-    None
+
+    AnchorResolve::None
+}
+
+async fn resolve_message_target(
+    state: &AppState,
+    chat_id: i64,
+    message_id: i64,
+) -> AnchorResolve {
+    if let Ok(Some(item)) = db::items::by_message(&state.pool, chat_id, message_id).await {
+        return AnchorResolve::Ready(item);
+    }
+    if let Ok(Some(text)) =
+        db::groups::buffer_text(&state.pool, chat_id, message_id).await
+    {
+        if let Some(url) = crate::intake::extract_urls(&text).into_iter().next() {
+            if let Ok(Some(item)) = db::items::by_url_in_chat(&state.pool, chat_id, &url).await {
+                return AnchorResolve::Ready(item);
+            }
+            return AnchorResolve::Pending { url };
+        }
+    }
+    AnchorResolve::None
+}
+
+fn esc_url(url: &str) -> String {
+    url.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn anchor_aware_query(question: &str, item: &RetrievedItem) -> String {
