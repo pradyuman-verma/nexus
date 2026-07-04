@@ -83,6 +83,70 @@ pub fn is_deictic_query(text: &str) -> bool {
     PHRASES.iter().any(|p| t.contains(p))
 }
 
+/// Follow-up that should inherit the session's active referents ("tell me more").
+pub fn is_follow_up_query(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    if t.is_empty() {
+        return false;
+    }
+    if is_broad_brain_query(&t) {
+        return false;
+    }
+    const PHRASES: &[&str] = &[
+        "tell me more",
+        "more about",
+        "more detail",
+        "more on",
+        "go deeper",
+        "elaborate",
+        "expand on",
+        "what about",
+        "how about",
+        "and the",
+        "compare",
+        " versus ",
+        " vs ",
+        "anything else",
+        "explain that",
+        "why is that",
+        "can you explain",
+        "what did you mean",
+        "what do you mean",
+        "keep going",
+        "continue",
+        "also",
+    ];
+    if PHRASES.iter().any(|p| t.contains(p)) {
+        return true;
+    }
+    // Short utterances in an active thread ("and pricing?", "the founder?").
+    let words = t.split_whitespace().count();
+    words <= 6 && (t.ends_with('?') || is_deictic_query(text))
+}
+
+/// Explicit whole-brain search — do not inherit session referents.
+pub fn is_broad_brain_query_pub(t: &str) -> bool {
+    is_broad_brain_query(t)
+}
+
+fn is_broad_brain_query(t: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "what have we",
+        "what have i",
+        "what did we",
+        "what did i",
+        "show me all",
+        "search my",
+        "search our",
+        "search the",
+        "find everything",
+        "list everything",
+        "everything we",
+        "everything i",
+    ];
+    PHRASES.iter().any(|p| t.contains(p))
+}
+
 /// Extract http(s) URLs from free text (whitespace-token scan + validation).
 pub fn extract_urls(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -265,5 +329,12 @@ mod tests {
         assert!(is_deictic_query("what do you think about this?"));
         assert!(is_deictic_query("thoughts on that link"));
         assert!(!is_deictic_query("what have we saved on robotics?"));
+    }
+
+    #[test]
+    fn follow_up_queries_detected() {
+        assert!(is_follow_up_query("tell me more"));
+        assert!(is_follow_up_query("what about the pricing?"));
+        assert!(!is_follow_up_query("what have we saved on robotics?"));
     }
 }

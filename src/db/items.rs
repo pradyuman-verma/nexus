@@ -244,6 +244,29 @@ pub async fn signal_source(pool: &PgPool, id: Uuid) -> Result<Option<(Vec<f32>, 
     Ok(row.map(|(emb, tags)| (emb.map(|v| v.to_vec()).unwrap_or_default(), tags)))
 }
 
+/// Load items by id (for session follow-up referents).
+pub async fn by_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<RetrievedItem>> {
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let rows: Vec<ItemRow> = sqlx::query_as(
+        r#"
+        SELECT i.id, i.url, i.title, i.summary, i.raw_content, i.tags, i.category,
+               i.context_window, i.shared_by, u.username, i.message_id, i.shared_at,
+               i.source_channel, i.content_type, i.group_id,
+               1.0 AS similarity
+        FROM items i
+        LEFT JOIN users u ON u.id = i.shared_by
+        WHERE i.id = ANY($1)
+        ORDER BY i.shared_at DESC
+        "#,
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 /// Item captured from a specific Telegram message (reply-to anchor).
 pub async fn by_message(
     pool: &PgPool,

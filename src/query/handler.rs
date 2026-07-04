@@ -3,7 +3,7 @@
 use crate::bot::formatter;
 use crate::db;
 use crate::llm::chat::QueryIntent;
-use crate::models::RetrievedItem;
+use crate::models::{RetrievedItem, SessionTurn, ThreadMode, ThreadState};
 use crate::search::WebSnippet;
 use crate::state::AppState;
 use anyhow::Result;
@@ -120,6 +120,8 @@ const NO_RESULTS_GROUP: &str =
     "Nothing shared in this chat covers that yet. Share a link here and I'll index it.";
 const STILL_READING: &str =
     "I'm still reading that link — give me about a minute after you share, then ask again.";
+const PARTIAL_INGEST_NOTE: &str =
+    "Note: I'm still ingesting the full page — this answer is based on the link and conversation context only.";
 const DEICTIC_NO_REFERENT: &str =
     "Not sure which item you mean — reply directly to the link or note you're asking about.";
 
@@ -131,8 +133,8 @@ struct Source {
 
 enum AnchorResolve {
     Ready(RetrievedItem),
-    /// URL seen in chat but ingest hasn't finished yet.
-    Pending { url: String },
+    /// URL seen in chat but the item row doesn't exist yet — synthesize from buffer/context.
+    Partial { url: String, message_id: i64 },
     None,
 }
 
@@ -159,29 +161,95 @@ pub async fn handle(
         return handle_web_only(state, query_text).await;
     }
 
+    let session = db::sessions::get_or_create(&state.pool, user_id, chat_id)
+        .await
+        .ok();
+    let recent_turns = if let Some(ref s) = session {
+        db::sessions::recent_turns(&state.pool, s.id)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let thread_state = session
+        .as_ref()
+        .map(|s| s.thread_state.clone())
+        .unwrap_or_default();
+
     let resolved = resolve_anchor(state, chat_id, user_id, &anchor, query_text).await;
     let deictic = crate::intake::is_deictic_query(query_text);
-    let (anchor_item, focused) = match &resolved {
+    let follow_up = crate::intake::is_follow_up_query(query_text);
+
+    let mut partial_ingest = false;
+    let (anchor_items, focused) = match resolved {
         AnchorResolve::Ready(item) => {
             let focused = anchor.reply_message_id.is_some() || deictic;
-            (Some(item.clone()), focused)
+            (vec![item], focused)
         }
-        AnchorResolve::Pending { url } => {
-            tracing::info!(chat_id, user_id, url = %url, "ask anchor pending ingest");
-            return Ok(QueryReply {
-                html: format!("{STILL_READING}\n\n<code>{}</code>", esc_url(url)),
-                cited_item_ids: vec![],
-            });
+        AnchorResolve::Partial { url, message_id } => {
+            match build_partial_item(state, chat_id, &url, message_id).await {
+                Some(item) => {
+                    tracing::info!(chat_id, user_id, url = %url, "ask partial in-flight ingest");
+                    partial_ingest = true;
+                    (vec![item], true)
+                }
+                None => {
+                    tracing::info!(chat_id, user_id, url = %url, "ask pending ingest — no context yet");
+                    let reply = QueryReply {
+                        html: format!("{STILL_READING}\n\n<code>{}</code>", esc_url(&url)),
+                        cited_item_ids: vec![],
+                    };
+                    record_session_turn(
+                        state,
+                        session.as_ref().map(|s| s.id),
+                        &thread_state,
+                        query_text,
+                        &[],
+                        None,
+                        &[],
+                    )
+                    .await;
+                    return Ok(reply);
+                }
+            }
         }
         AnchorResolve::None if deictic => {
             tracing::info!(chat_id, user_id, "ask deictic without referent");
-            return Ok(QueryReply {
+            let reply = QueryReply {
                 html: DEICTIC_NO_REFERENT.to_string(),
                 cited_item_ids: vec![],
-            });
+            };
+            record_session_turn(
+                state,
+                session.as_ref().map(|s| s.id),
+                &thread_state,
+                query_text,
+                &[],
+                None,
+                &[],
+            )
+            .await;
+            return Ok(reply);
         }
-        AnchorResolve::None => (None, false),
+        AnchorResolve::None if follow_up && !thread_state.active_item_ids.is_empty() => {
+            let items = db::items::by_ids(&state.pool, &thread_state.active_item_ids)
+                .await
+                .unwrap_or_default();
+            if items.is_empty() {
+                (vec![], false)
+            } else {
+                tracing::info!(
+                    chat_id,
+                    user_id,
+                    items = items.len(),
+                    "ask follow-up inheriting session referents"
+                );
+                (items, true)
+            }
+        }
+        AnchorResolve::None => (vec![], false),
     };
+    let anchor_item = anchor_items.first().cloned();
     if focused {
         tracing::info!(
             chat_id,
@@ -275,14 +343,19 @@ pub async fn handle(
     );
 
     let taste = db::taste::get(&state.pool, user_id).await.ok().flatten();
-    let system_prompt = build_system_prompt(scope, taste.as_ref(), focused);
+    let system_prompt = build_system_prompt(scope, taste.as_ref(), focused, partial_ingest);
 
     // Retrieve (hybrid + graph), synthesize, and self-correct once if the model
     // says the corpus can't answer and offers follow-up queries.
     let mut keyword_query = embed_text.clone();
     for attempt in 0..2u8 {
-        let mut sources = if let Some(item) = anchor_item.as_ref().filter(|_| focused) {
-            anchor_sources(state, scope, user_id, item, &embeds).await
+        let mut sources = if partial_ingest {
+            anchor_items
+                .first()
+                .map(partial_sources)
+                .unwrap_or_default()
+        } else if focused && !anchor_items.is_empty() {
+            focused_sources(state, scope, user_id, &anchor_items, &embeds).await
         } else {
             let hits = hybrid_retrieve(state, scope, user_id, &keyword_query, &embeds).await;
             group_hits(hits)
@@ -316,13 +389,20 @@ pub async fn handle(
 
         let items: Vec<RetrievedItem> = sources.iter().map(|s| s.item.clone()).collect();
         let context = build_context(&sources);
-        let user_msg = if focused {
+        let thread_block = format_thread_context(&recent_turns);
+        let user_msg = if partial_ingest {
             format!(
-                "The user is asking about the specific capture marked [1] (ANCHOR).\n\
+                "{thread_block}The user is asking about a link that is STILL BEING INGESTED. \
+                 Only the URL and conversation context are available — do not invent page content.\n\
+                 Sources:\n{context}\n\nQuestion: {query_text}"
+            )
+        } else if focused {
+            format!(
+                "{thread_block}The user is asking about the specific capture(s) marked [1] (ANCHOR).\n\
                  Sources:\n{context}\n\nQuestion: {query_text}"
             )
         } else {
-            format!("Sources:\n{context}\n\nQuestion: {query_text}")
+            format!("{thread_block}Sources:\n{context}\n\nQuestion: {query_text}")
         };
         let raw = state.chat.synthesize(&system_prompt, &user_msg).await?;
 
@@ -350,9 +430,33 @@ pub async fn handle(
                 let cited_item_ids: Vec<Uuid> = cited
                     .iter()
                     .filter_map(|n| items.get(n - 1).map(|i| i.id))
+                    .filter(|id| *id != crate::models::partial_item_id())
                     .collect();
+                let mut html = formatter::query_answer(&answer, &items, &cited, &[], &[]);
+                if partial_ingest {
+                    html = format!("{PARTIAL_INGEST_NOTE}\n\n{html}");
+                }
+                let new_thread = next_thread_state(
+                    &thread_state,
+                    query_text,
+                    focused,
+                    follow_up,
+                    partial_ingest,
+                    &anchor_items,
+                    &cited_item_ids,
+                );
+                record_session_turn(
+                    state,
+                    session.as_ref().map(|s| s.id),
+                    &new_thread,
+                    query_text,
+                    &anchor_items,
+                    Some(&answer),
+                    &cited_item_ids,
+                )
+                .await;
                 return Ok(QueryReply {
-                    html: formatter::query_answer(&answer, &items, &cited, &[], &[]),
+                    html,
                     cited_item_ids,
                 });
             }
@@ -626,12 +730,19 @@ fn build_system_prompt(
     scope: QueryScope,
     taste: Option<&crate::models::UserTasteProfile>,
     anchored: bool,
+    partial_ingest: bool,
 ) -> String {
     let base = match scope {
         QueryScope::Personal => SYSTEM_PROMPT_PERSONAL,
         QueryScope::Group(_) => SYSTEM_PROMPT_GROUP,
     };
-    let mut out = if anchored {
+    let mut out = if partial_ingest {
+        format!(
+            "{base}\n\nIMPORTANT: The capture is STILL INGESTING. You only have the URL and \
+             conversation context — not the full page. Answer cautiously from that context; \
+             say you're still reading the page if the question needs full content."
+        )
+    } else if anchored {
         format!(
             "{base}\n\nIMPORTANT: The user pointed at a specific capture (ANCHOR, source [1]). \
              Answer primarily about that item. Do not synthesize unrelated sources unless \
@@ -697,7 +808,7 @@ async fn resolve_anchor(
                 {
                     return AnchorResolve::Ready(item);
                 }
-                return AnchorResolve::Pending { url };
+                return AnchorResolve::Partial { url, message_id: mid };
             }
         }
 
@@ -729,10 +840,169 @@ async fn resolve_message_target(
             if let Ok(Some(item)) = db::items::by_url_in_chat(&state.pool, chat_id, &url).await {
                 return AnchorResolve::Ready(item);
             }
-            return AnchorResolve::Pending { url };
+            return AnchorResolve::Partial { url, message_id };
         }
     }
     AnchorResolve::None
+}
+
+async fn build_partial_item(
+    state: &AppState,
+    chat_id: i64,
+    url: &str,
+    message_id: i64,
+) -> Option<RetrievedItem> {
+    let ctx = crate::intake::build_context_window(state, chat_id, message_id, false, None).await;
+    let ctx_text = ctx.as_text();
+    let buffer = db::groups::buffer_text(&state.pool, chat_id, message_id)
+        .await
+        .ok()
+        .flatten();
+    let has_buffer = buffer.as_deref().is_some_and(|t| !t.trim().is_empty());
+    if ctx_text.trim().is_empty() && !has_buffer {
+        return None;
+    }
+    let domain = crate::bot::formatter::domain_of(url).unwrap_or_else(|| url.to_string());
+    Some(RetrievedItem {
+        id: crate::models::partial_item_id(),
+        url: url.to_string(),
+        title: Some(domain),
+        summary: Some(
+            "Full page content is still being ingested — use the URL and conversation context only."
+                .into(),
+        ),
+        raw_content: buffer,
+        tags: vec![],
+        category: None,
+        context_window: Some(ctx),
+        shared_by: None,
+        shared_by_username: None,
+        message_id: Some(message_id),
+        shared_at: chrono::Utc::now(),
+        similarity: 1.0,
+        source_channel: None,
+        content_type: Some("article".into()),
+        group_id: Some(chat_id),
+    })
+}
+
+fn partial_sources(item: &RetrievedItem) -> Vec<Source> {
+    let mut passages = Vec::new();
+    if let Some(ref raw) = item.raw_content {
+        if !raw.trim().is_empty() {
+            passages.push(raw.clone());
+        }
+    }
+    if let Some(ref ctx) = item.context_window {
+        let t = ctx.as_text();
+        if !t.trim().is_empty() {
+            passages.push(format!("Conversation around the share:\n{t}"));
+        }
+    }
+    if let Some(ref s) = item.summary {
+        passages.push(s.clone());
+    }
+    if passages.is_empty() {
+        passages.push(format!("Link: {}", item.url));
+    }
+    vec![Source {
+        item: item.clone(),
+        passages,
+    }]
+}
+
+fn format_thread_context(turns: &[SessionTurn]) -> String {
+    if turns.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Recent conversation:\n");
+    for t in turns {
+        let role = if t.role == "user" { "User" } else { "Nexus" };
+        out.push_str(&format!("{role}: {}\n", snippet(&t.text, 200)));
+    }
+    out.push('\n');
+    out
+}
+
+fn next_thread_state(
+    prev: &ThreadState,
+    query_text: &str,
+    focused: bool,
+    follow_up: bool,
+    partial_ingest: bool,
+    anchor_items: &[RetrievedItem],
+    cited_item_ids: &[Uuid],
+) -> ThreadState {
+    let partial = crate::models::partial_item_id();
+    let real_anchor_ids: Vec<Uuid> = anchor_items
+        .iter()
+        .map(|i| i.id)
+        .filter(|id| *id != partial)
+        .collect();
+
+    let active_item_ids = if partial_ingest {
+        prev.active_item_ids.clone()
+    } else if focused {
+        if !cited_item_ids.is_empty() {
+            cited_item_ids.to_vec()
+        } else {
+            real_anchor_ids
+        }
+    } else if crate::intake::is_broad_brain_query_pub(&query_text.to_lowercase()) {
+        Vec::new()
+    } else if !cited_item_ids.is_empty() {
+        cited_item_ids.to_vec()
+    } else {
+        prev.active_item_ids.clone()
+    };
+
+    let mode = if focused || follow_up {
+        ThreadMode::Focused
+    } else if active_item_ids.is_empty() {
+        ThreadMode::Open
+    } else {
+        ThreadMode::Open
+    };
+
+    ThreadState {
+        active_item_ids,
+        mode,
+        last_intent: Some(snippet(query_text, 120)),
+    }
+}
+
+async fn record_session_turn(
+    state: &AppState,
+    session_id: Option<Uuid>,
+    thread_state: &ThreadState,
+    user_text: &str,
+    anchor_items: &[RetrievedItem],
+    assistant_text: Option<&str>,
+    cited_item_ids: &[Uuid],
+) {
+    let Some(session_id) = session_id else {
+        return;
+    };
+    let partial = crate::models::partial_item_id();
+    let user_item_ids: Vec<Uuid> = anchor_items
+        .iter()
+        .map(|i| i.id)
+        .filter(|id| *id != partial)
+        .collect();
+    let assistant = assistant_text.unwrap_or("").to_string();
+    if let Err(e) = db::sessions::append_exchange(
+        &state.pool,
+        session_id,
+        user_text,
+        &user_item_ids,
+        &assistant,
+        cited_item_ids,
+        thread_state,
+    )
+    .await
+    {
+        tracing::debug!(error = %e, "session turn persist failed");
+    }
 }
 
 fn esc_url(url: &str) -> String {
@@ -750,15 +1020,18 @@ fn anchor_aware_query(question: &str, item: &RetrievedItem) -> String {
     format!("{question} — specifically about: {label} ({})", item.url)
 }
 
-/// Retrieve passages for a single anchored item only.
-async fn anchor_sources(
+/// Retrieve passages for one or more anchored items only.
+async fn focused_sources(
     state: &AppState,
     scope: QueryScope,
     user_id: i64,
-    item: &RetrievedItem,
+    items: &[RetrievedItem],
     embeds: &[Vec<f32>],
 ) -> Vec<Source> {
-    let item_ids = [item.id];
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let item_ids: Vec<Uuid> = items.iter().map(|i| i.id).collect();
     let mut lists = Vec::new();
     match scope {
         QueryScope::Personal => {
@@ -796,16 +1069,20 @@ async fn anchor_sources(
     if !hits.is_empty() {
         return group_hits(hits);
     }
-    // Item ingested but no chunks yet — fall back to summary / raw text.
-    let passage = item
-        .summary
-        .clone()
-        .or_else(|| item.raw_content.clone())
-        .unwrap_or_else(|| item.url.clone());
-    vec![Source {
-        item: item.clone(),
-        passages: vec![passage],
-    }]
+    items
+        .iter()
+        .filter_map(|item| {
+            let passage = item
+                .summary
+                .clone()
+                .or_else(|| item.raw_content.clone())
+                .unwrap_or_else(|| item.url.clone());
+            Some(Source {
+                item: item.clone(),
+                passages: vec![passage],
+            })
+        })
+        .collect()
 }
 
 /// Hybrid retrieval over multiple query embeddings: vector search per embedding
@@ -1286,6 +1563,42 @@ mod tests {
             content_type: Some("article".into()),
             group_id: Some(-100123),
         }
+    }
+
+    #[test]
+    fn partial_sources_uses_context() {
+        use crate::models::{ContextMessage, ContextPosition, ContextWindow};
+        let item = RetrievedItem {
+            id: crate::models::partial_item_id(),
+            url: "https://example.com".into(),
+            title: Some("example.com".into()),
+            summary: Some("still ingesting".into()),
+            raw_content: Some("https://example.com".into()),
+            tags: vec![],
+            category: None,
+            context_window: Some(ContextWindow {
+                messages: vec![ContextMessage {
+                    user_id: Some(1),
+                    username: Some("alice".into()),
+                    message_id: 42,
+                    text: "check this out".into(),
+                    position: ContextPosition::Pivot,
+                }],
+                forwarded: false,
+                forward_origin: None,
+            }),
+            shared_by: None,
+            shared_by_username: None,
+            message_id: Some(42),
+            shared_at: chrono::Utc::now(),
+            similarity: 1.0,
+            source_channel: None,
+            content_type: Some("article".into()),
+            group_id: Some(-100),
+        };
+        let sources = partial_sources(&item);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].passages.iter().any(|p| p.contains("check this out")));
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub mod groups;
 pub mod items;
 pub mod notifications;
 pub mod profiles;
+pub mod sessions;
 pub mod taste;
 
 use anyhow::{Context, Result};

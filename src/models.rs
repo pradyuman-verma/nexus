@@ -140,6 +140,40 @@ fn default_signal_strength() -> f32 {
     1.0
 }
 
+/// Working-memory thread state for a chat session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ThreadState {
+    #[serde(default)]
+    pub active_item_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub mode: ThreadMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_intent: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadMode {
+    #[default]
+    Open,
+    Focused,
+}
+
+/// One turn in a chat session (user or assistant).
+#[derive(Debug, Clone)]
+pub struct SessionTurn {
+    pub role: String,
+    pub text: String,
+    pub item_ids: Vec<Uuid>,
+    pub cited_item_ids: Vec<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Ephemeral id for in-flight captures not yet persisted as items.
+pub fn partial_item_id() -> Uuid {
+    Uuid::from_u128(0)
+}
+
 /// A stored knowledge-graph item, as retrieved for query synthesis.
 #[allow(dead_code)] // id/category/shared_by/similarity used by future ranking + dashboard
 #[derive(Debug, Clone)]
